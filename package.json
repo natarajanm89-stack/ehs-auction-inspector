@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "check:rls": "node scripts/check-rls.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.116.0",
