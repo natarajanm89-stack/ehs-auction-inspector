@@ -4,6 +4,7 @@ import type { Decision, Machine, MachineState } from './types'
 import { autoDecision, blankState, calc } from './lib/calc'
 import { can, type Profile } from './lib/profile'
 import { clearAll, onStorageError } from './lib/db'
+import { importLegacy, readLegacyState } from './lib/migrate'
 import { subscribeStatus } from './lib/sync'
 import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
@@ -35,6 +36,7 @@ function App({ profile }: { profile: Profile }) {
   const [priority, setPriority] = useState('All')
   const [detailLot, setDetailLot] = useState<number | null>(null)
   const [storageError, setStorageError] = useState('')
+  const [legacyCount, setLegacyCount] = useState(() => Object.keys(readLegacyState() ?? {}).length)
 
   useEffect(() => onStorageError(setStorageError), [])
   // A transient storage failure shouldn't leave the banner stuck for the
@@ -103,6 +105,16 @@ function App({ profile }: { profile: Profile }) {
         <button key={key} className={tab===key?'active':''} onClick={()=>setTab(key)}>{label}</button>
       )}
     </nav>
+
+    {legacyCount > 0 && canWrite && (
+      <div className="legacy-banner">
+        <span>{legacyCount} lot{legacyCount > 1 ? 's' : ''} of inspection data
+          from this device has not been uploaded yet.</span>
+        <button className="primary" onClick={async () => {
+          await importLegacy(); setLegacyCount(0)
+        }}>Upload now</button>
+      </div>
+    )}
 
     <main>
       {tab === 'dashboard' && <section className="page">
