@@ -617,7 +617,7 @@ Two functions carry the whole design: one is the only path to a role, the other 
 - Consumes: tables from Task 3
 - Produces:
   - `ehs.caller_role() returns text` — SECURITY DEFINER, reads caller's role
-  - `ehs.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, raises on failure
+  - `ehs.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, or `'invalid_code'` / `'rate_limited'` (raises only on `not authenticated` / bad name, before any writes)
   - `ehs.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
   - `ehs.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
 
@@ -664,10 +664,9 @@ begin
     raise exception 'name must be between 1 and 60 characters';
   end if;
 
-  -- Rate limit: 10 attempts per 15 minutes per anonymous identity.
-  -- Note: per-uid limiting is weak because anonymous identities are unlimited
-  -- (a caller can mint a fresh uid to reset the counter); code length is the
-  -- real defence.
+  -- Rate limit: 10 attempts per 15 minutes per identity. Only failed
+  -- attempts increment the counter (see below), and success never touches
+  -- it, so a legitimate inspector redeeming repeatedly is never locked out.
   insert into ehs.code_attempts (uid, attempts, first_at)
     values (v_uid, 0, now())
   on conflict (uid) do update set uid = excluded.uid
@@ -679,17 +678,18 @@ begin
   end if;
 
   if v_tries >= 10 then
-    raise exception 'too many attempts, try again later';
+    return 'rate_limited';
   end if;
-
-  update ehs.code_attempts set attempts = attempts + 1 where uid = v_uid;
 
   select role into v_role
     from ehs.access_codes
    where code_hash = crypt(p_code, code_hash);
 
   if v_role is null then
-    raise exception 'invalid access code';
+    update ehs.code_attempts set attempts = attempts + 1 where uid = v_uid;
+    -- Must return, not raise: raising here would abort the transaction and
+    -- roll back the increment above, defeating the rate limit entirely.
+    return 'invalid_code';
   end if;
 
   insert into ehs.profiles (id, display_name, role)
@@ -1151,6 +1151,8 @@ export async function redeemCode(code: string, displayName: string): Promise<Rol
     p_display_name: displayName.trim(),
   })
   if (error) throw new Error(error.message)
+  if (data === 'invalid_code') throw new Error('That access code is not recognised.')
+  if (data === 'rate_limited') throw new Error('Too many attempts. Wait 15 minutes and try again.')
   return data as Role
 }
 ```
@@ -1299,7 +1301,7 @@ function App({ profile }: { profile: Profile }) {
 
 - [ ] **Step 5: Verify manually**
 
-Fill `.env` with your real values, then `npm run dev`. Expected: the gate appears; a wrong code shows "invalid access code"; the inspector code lets you through to the app.
+Fill `.env` with your real values, then `npm run dev`. Expected: the gate appears; a wrong code shows "That access code is not recognised."; the inspector code lets you through to the app.
 
 - [ ] **Step 6: Commit**
 

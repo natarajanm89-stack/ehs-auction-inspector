@@ -50,17 +50,18 @@ begin
   end if;
 
   if v_tries >= 10 then
-    raise exception 'too many attempts, try again later';
+    return 'rate_limited';
   end if;
-
-  update ehs.code_attempts set attempts = attempts + 1 where uid = v_uid;
 
   select role into v_role
     from ehs.access_codes
    where code_hash = crypt(p_code, code_hash);
 
   if v_role is null then
-    raise exception 'invalid access code';
+    update ehs.code_attempts set attempts = attempts + 1 where uid = v_uid;
+    -- Must return, not raise: raising here would abort the transaction and
+    -- roll back the increment above, defeating the rate limit entirely.
+    return 'invalid_code';
   end if;
 
   insert into ehs.profiles (id, display_name, role)
