@@ -9,7 +9,7 @@ import { subscribeStatus } from './lib/sync'
 import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
 import { SignOut } from './components/SignOut'
-import { Photos } from './components/Photos'
+import { Photos, drainPendingPhotos } from './components/Photos'
 import { Comments, useUnreadCounts } from './components/Comments'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'settings'
@@ -42,6 +42,15 @@ function App({ profile }: { profile: Profile }) {
   // A transient storage failure shouldn't leave the banner stuck for the
   // whole session - clear it once sync subsequently reports healthy.
   useEffect(() => subscribeStatus(s => { if (s.status === 'synced') setStorageError('') }), [])
+
+  // Drain every pending photo on this device, not just the lot on screen -
+  // an inspector may shoot a lot and never revisit it while online.
+  useEffect(() => {
+    void drainPendingPhotos(profile.id)
+    const onOnline = () => { void drainPendingPhotos(profile.id) }
+    window.addEventListener('online', onOnline)
+    return () => window.removeEventListener('online', onOnline)
+  }, [profile.id])
 
   const selected = machines.find(m => m.lot === selectedLot) || machines[0]
   const selectedState = states[selected.lot]
@@ -226,8 +235,8 @@ function App({ profile }: { profile: Profile }) {
         <div className="panel"><h3>Commercial assumptions</h3><p>EUR→INR FX, freight, duty/import percentage, inland cost, repair reserve, contingency and target margin are editable per machine. The app does not claim these are tax advice or final customs values.</p></div>
         <div className="panel"><h3>Data provenance</h3><p>Starter lot facts come from the Ritchie Bros. Zevenbergen catalog/PDP pages checked on 7 Sep 2026. Auction catalog details can change. EHS inspection results are separate fields and should be treated as the controlling condition assessment.</p></div>
         <SignOut />
-        <div className="panel danger-panel"><h3>Reset this device</h3><p>Clears the local cache and any unsent edits on this device. Data already
-           synced to the server is not affected.</p><button className="danger-button" onClick={async ()=>{if(confirm('Clear local cache and unsent edits on this device?')){await clearAll(); location.reload()}}}>Reset local cache</button></div>
+        <div className="panel danger-panel"><h3>Reset this device</h3><p>Clears the local cache, any unsent edits, and any photos not yet uploaded on this device. Data already
+           synced to the server is not affected.</p><button className="danger-button" onClick={async ()=>{if(confirm('Clear local cache, unsent edits, and unsent photos on this device?')){await clearAll(); location.reload()}}}>Reset local cache</button></div>
       </section>}
     </main>
 

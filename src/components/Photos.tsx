@@ -30,6 +30,58 @@ function downscale(file: File): Promise<Blob> {
 const SIGNED_URL_TTL = 3600
 const SIGNED_URL_REFRESH_MS = 45 * 60 * 1000
 
+/**
+ * Uploads one pending photo and records its row. Idempotent: safe to call
+ * again for a blob whose bytes already reached Storage (e.g. the upload
+ * succeeded but the response was lost on a flaky connection).
+ *
+ * `upsert` is deliberately NOT used. `upsert: true` turns a re-upload of an
+ * existing object into an UPDATE on storage.objects, and the storage
+ * policies (db/0003_rls.sql) grant this bucket only SELECT/INSERT/DELETE -
+ * no UPDATE, and we are not adding one (the bucket is shared with unrelated
+ * live applications, and append-only is the safer posture). So a plain
+ * upload is used, and "already exists" is treated as success instead: the
+ * bytes are already there, which is exactly what a retry is trying to
+ * achieve.
+ */
+export async function uploadPhoto(lot: number, id: string, blob: Blob, profileId: string): Promise<boolean> {
+  const { error: uploadError } = await supabase.storage
+    .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg' })
+  if (uploadError) {
+    const err = uploadError as { statusCode?: string | number; status?: number; message?: string }
+    const status = Number(err.statusCode ?? err.status)
+    const alreadyExists = status === 409 || /already exists/i.test(err.message ?? '')
+    if (!alreadyExists) return false        // stays pending, retried later
+  }
+
+  const { error: insertError } = await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
+  // A unique-violation on storage_path means a previous attempt already
+  // created the row (e.g. storage succeeded but the insert failed or the
+  // connection dropped before the response arrived). That is success, not
+  // failure - the evidence is already recorded.
+  if (insertError && insertError.code !== '23505') return false
+
+  await deletePhotoBlob(id)
+  return true
+}
+
+/**
+ * Drains every pending photo blob on this device, not just the ones for a
+ * lot currently on screen. Without this, a photo shot on a lot the inspector
+ * never revisits while online is stuck on the phone forever - and "Reset
+ * local cache" would delete it silently.
+ */
+export async function drainPendingPhotos(profileId: string): Promise<void> {
+  for (const id of await listPendingPhotos()) {
+    const lotStr = id.split('/')[0]
+    const lot = Number(lotStr)
+    if (!lotStr || Number.isNaN(lot)) continue
+    const blob = await getPhotoBlob(id)
+    if (!blob) continue
+    await uploadPhoto(lot, id, blob, profileId)
+  }
+}
+
 export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: boolean; profileId: string }) {
   const [shots, setShots] = useState<Shot[]>([])
   const [busy, setBusy] = useState(false)
@@ -96,21 +148,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
     }
   }, [load])
 
-  const upload = async (id: string, blob: Blob) => {
-    const { error: uploadError } = await supabase.storage
-      .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg', upsert: true })
-    if (uploadError) return false           // stays pending, retried on next load
-
-    const { error: insertError } = await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
-    // A unique-violation on storage_path means a previous attempt already
-    // created the row (e.g. storage succeeded but the insert failed or the
-    // connection dropped before the response arrived). That is success, not
-    // failure - the evidence is already recorded.
-    if (insertError && insertError.code !== '23505') return false
-
-    await deletePhotoBlob(id)
-    return true
-  }
+  const upload = async (id: string, blob: Blob) => uploadPhoto(lot, id, blob, profileId)
 
   const onPick = async (files: FileList | null) => {
     if (!files?.length) return
