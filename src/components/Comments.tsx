@@ -26,6 +26,7 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
   const [items, setItems] = useState<Comment[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
+  const [sendError, setSendError] = useState('')
 
   const load = useCallback(async () => {
     const { data } = await supabase.from('comments')
@@ -67,7 +68,16 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
       lot, author_id: profile.id, author_name: profile.display_name, body,
     })
     setBusy(false)
-    if (!error) { setDraft(''); await load() }
+    if (!error) {
+      setSendError('')
+      setDraft('')
+      await load()
+      return
+    }
+    // Comments are not queued in the outbox (see the design doc) - the
+    // minimum honest behaviour is to keep the draft and say so plainly,
+    // rather than silently discarding what the inspector typed.
+    setSendError('Not sent - you appear to be offline. Your text is kept; try again when you have signal.')
   }
 
   return (
@@ -89,6 +99,7 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
         <textarea rows={3} value={draft} maxLength={4000}
                   onChange={e => setDraft(e.target.value)}
                   placeholder="Question or instruction for the inspection team…" />
+        {sendError && <p className="comment-error" role="alert">{sendError}</p>}
         <button className="primary" disabled={busy || !draft.trim()}>
           {busy ? 'Posting…' : 'Post comment'}
         </button>
