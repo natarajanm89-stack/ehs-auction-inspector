@@ -275,3 +275,12 @@ td select { min-width:110px; padding:7px; }
 .photo-grid figure.pending img { opacity: .55; }
 .photo-grid figcaption { position: absolute; left: 6px; bottom: 6px; font-size: 11px;
   background: rgba(0,0,0,.65); color: #fff; padding: 2px 6px; border-radius: 5px; }
+
+.comment-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.comment-list li { background: #f6f8fb; border-radius: 10px; padding: 10px 12px; }
+.comment-head { display: flex; justify-content: space-between; gap: 8px;
+  font-size: 12px; color: #5b667f; }
+.comment-list p { margin: 5px 0 0; white-space: pre-wrap; }
+.comment-form { display: grid; gap: 8px; margin-top: 12px; }
+.unread-dot { background: #b42318; color: #fff; border-radius: 999px; font-size: 11px;
+  font-weight: 700; padding: 1px 7px; }

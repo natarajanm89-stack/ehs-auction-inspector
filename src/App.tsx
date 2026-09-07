@@ -9,6 +9,7 @@ import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
 import { SignOut } from './components/SignOut'
 import { Photos } from './components/Photos'
+import { Comments, useUnreadCounts } from './components/Comments'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'settings'
 
@@ -26,6 +27,7 @@ function ScoreBar({ value }: { value: number }) {
 function App({ profile }: { profile: Profile }) {
   const canWrite = can(profile.role, 'write_state')
   const { states, ready, patchState } = useAllMachineStates(canWrite)
+  const unread = useUnreadCounts(profile.id)
   const [tab, setTab] = useState<Tab>('dashboard')
   const [selectedLot, setSelectedLot] = useState<number>(machines[0].lot)
   const [search, setSearch] = useState('')
@@ -131,7 +133,7 @@ function App({ profile }: { profile: Profile }) {
         <div className="category-grid">{CATEGORY_COUNTS.map(c => <div className="category-card" key={c.label}><strong>{c.count}</strong><span>{c.label}</span><ScoreBar value={Math.min(100,c.count/1.5)} /></div>)}</div>
 
         <div className="section-head"><div><span className="eyebrow">TODAY'S ROUTE</span><h2>Inspection order</h2></div><button className="ghost" onClick={()=>setTab('machines')}>View all</button></div>
-        <div className="machine-strip">{machines.filter(m=>m.priority==='P1').slice(0,5).map(m => <MachineCard key={m.lot} machine={m} state={states[m.lot]} compact onOpen={()=>navigateMachine(m.lot)} onDetail={()=>setDetailLot(m.lot)} onShortlist={()=>patchState(m.lot,'decision',s=>({...s,shortlist:!s.shortlist}))} canWrite={canWrite}/>)}</div>
+        <div className="machine-strip">{machines.filter(m=>m.priority==='P1').slice(0,5).map(m => <MachineCard key={m.lot} machine={m} state={states[m.lot]} compact onOpen={()=>navigateMachine(m.lot)} onDetail={()=>setDetailLot(m.lot)} onShortlist={()=>patchState(m.lot,'decision',s=>({...s,shortlist:!s.shortlist}))} canWrite={canWrite} unread={unread[m.lot] ?? 0}/>)}</div>
       </section>}
 
       {tab === 'machines' && <section className="page">
@@ -141,7 +143,7 @@ function App({ profile }: { profile: Profile }) {
           <select value={category} onChange={e=>setCategory(e.target.value)}><option>All</option>{[...new Set(machines.map(m=>m.category))].map(x=><option key={x}>{x}</option>)}</select>
           <select value={priority} onChange={e=>setPriority(e.target.value)}><option>All</option><option>P1</option><option>P2</option><option>P3</option></select>
         </div>
-        <div className="machine-grid">{filtered.map(m => <MachineCard key={m.lot} machine={m} state={states[m.lot]} onOpen={()=>navigateMachine(m.lot)} onDetail={()=>setDetailLot(m.lot)} onShortlist={()=>patchState(m.lot,'decision',s=>({...s,shortlist:!s.shortlist}))} canWrite={canWrite}/>)}</div>
+        <div className="machine-grid">{filtered.map(m => <MachineCard key={m.lot} machine={m} state={states[m.lot]} onOpen={()=>navigateMachine(m.lot)} onDetail={()=>setDetailLot(m.lot)} onShortlist={()=>patchState(m.lot,'decision',s=>({...s,shortlist:!s.shortlist}))} canWrite={canWrite} unread={unread[m.lot] ?? 0}/>)}</div>
       </section>}
 
       {tab === 'inspect' && <section className="page inspection-page">
@@ -174,6 +176,8 @@ function App({ profile }: { profile: Profile }) {
               <label className="full">Field notes<textarea disabled={!canWrite} rows={5} value={selectedState.inspection.notes} onChange={e=>patchState(selected.lot,'inspection',s=>({...s,inspection:{...s.inspection,notes:e.target.value}}))} placeholder="Leaks, noise, welds, battery dates, error codes, tyres, documents, parts needed…"/></label>
               <Photos lot={selected.lot} canWrite={canWrite} profileId={profile.id} />
             </div>
+
+            <Comments lot={selected.lot} profile={profile} />
           </div>
 
           <aside className="commercial-panel">
@@ -219,12 +223,12 @@ function App({ profile }: { profile: Profile }) {
   </div>
 }
 
-function MachineCard({ machine, state, compact=false, onOpen, onDetail, onShortlist, canWrite=true }: { machine: Machine, state: MachineState, compact?: boolean, onOpen:()=>void, onDetail:()=>void, onShortlist:()=>void, canWrite?: boolean }) {
+function MachineCard({ machine, state, compact=false, onOpen, onDetail, onShortlist, canWrite=true, unread=0 }: { machine: Machine, state: MachineState, compact?: boolean, onOpen:()=>void, onDetail:()=>void, onShortlist:()=>void, canWrite?: boolean, unread?: number }) {
   const c = calc(machine, state || blankState())
   const d = autoDecision(machine, state || blankState())
   return <article className={`machine-card ${compact?'compact':''}`}>
     <div className="image-wrap"><img src={machine.imageUrl} alt={machine.title}/><div className="image-tags"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><button disabled={!canWrite} className={`shortlist-btn ${state?.shortlist?'on':''}`} onClick={onShortlist} title="Shortlist">★</button></div></div>
-    <div className="machine-body"><div className="lot-line"><strong>LOT {machine.lot}</strong><Badge>{machine.category.replace(' Lift','')}</Badge></div><h3>{machine.make} {machine.model}</h3><p>{machine.year} · {machine.hours?.toLocaleString()} h · {machine.power}</p>{!compact && <div className="mini-specs">{machine.features.slice(0,2).map(x=><span key={x}>{x}</span>)}</div>}<div className="card-bottom"><div><small>Inspection</small><strong>{c.technical ? `${c.technical}%` : 'Not started'}</strong></div><Badge tone={d==='BUY'?'good':d==='BUY_IF'?'warn':d==='REJECT'?'danger':'neutral'}>{decisionLabel(d)}</Badge></div><div className="card-actions"><button className="primary" onClick={onOpen}>Inspect</button><button className="ghost" onClick={onDetail}>Details</button></div></div>
+    <div className="machine-body"><div className="lot-line"><strong>LOT {machine.lot}</strong>{unread > 0 && <span className="unread-dot">{unread}</span>}<Badge>{machine.category.replace(' Lift','')}</Badge></div><h3>{machine.make} {machine.model}</h3><p>{machine.year} · {machine.hours?.toLocaleString()} h · {machine.power}</p>{!compact && <div className="mini-specs">{machine.features.slice(0,2).map(x=><span key={x}>{x}</span>)}</div>}<div className="card-bottom"><div><small>Inspection</small><strong>{c.technical ? `${c.technical}%` : 'Not started'}</strong></div><Badge tone={d==='BUY'?'good':d==='BUY_IF'?'warn':d==='REJECT'?'danger':'neutral'}>{decisionLabel(d)}</Badge></div><div className="card-actions"><button className="primary" onClick={onOpen}>Inspect</button><button className="ghost" onClick={onDetail}>Details</button></div></div>
   </article>
 }
 
