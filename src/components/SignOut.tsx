@@ -13,7 +13,7 @@ export function SignOut() {
   const [sync, setSync] = useState<SyncSnapshot>({ status: 'synced', pending: 0, lastSyncedAt: null })
   useEffect(() => subscribeStatus(setSync), [])
 
-  const blocked = sync.pending > 0
+  const blocked = sync.pending > 0 || sync.status !== 'synced'
 
   const signOut = async () => {
     if (blocked) return

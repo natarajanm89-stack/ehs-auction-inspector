@@ -4,6 +4,7 @@ import type { Decision, Machine, MachineState } from './types'
 import { autoDecision, blankState, calc } from './lib/calc'
 import { can, type Profile } from './lib/profile'
 import { clearAll, onStorageError } from './lib/db'
+import { subscribeStatus } from './lib/sync'
 import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
 import { SignOut } from './components/SignOut'
@@ -33,6 +34,9 @@ function App({ profile }: { profile: Profile }) {
   const [storageError, setStorageError] = useState('')
 
   useEffect(() => onStorageError(setStorageError), [])
+  // A transient storage failure shouldn't leave the banner stuck for the
+  // whole session - clear it once sync subsequently reports healthy.
+  useEffect(() => subscribeStatus(s => { if (s.status === 'synced') setStorageError('') }), [])
 
   const selected = machines.find(m => m.lot === selectedLot) || machines[0]
   const selectedState = states[selected.lot]

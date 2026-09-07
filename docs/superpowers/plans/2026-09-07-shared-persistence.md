@@ -2110,6 +2110,11 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
         async payload => {
           const row: any = payload.new
           if (!row?.lot) return
+          // Never overwrite a lot with unsynced local edits - the outbox is the
+          // durable record of those, and it survives reloads.
+          const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+          const dirty = await Promise.all(groups.map(g => isDirty(row.lot, g)))
+          if (dirty.some(Boolean)) return
           const state = rowToState(row)
           await putState(row.lot, state)
           onRemoteState(row.lot, state)
@@ -2127,7 +2132,7 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
 }
 ```
 
-The caller of `onRemoteState` is responsible for not clobbering a locally-dirty lot — that check lives in `useMachineState` (Task 10), which knows what the user is currently editing.
+The dirty check lives here, not with the caller: the outbox (`isDirty` from `db.ts`) is the durable record of unsynced local edits — it survives reloads, unlike any in-memory flag — and both the cache write (`putState`) and the caller's `onRemoteState` callback must be gated on it. `useMachineState` (Task 10) therefore no longer needs its own dirty check for realtime rows; it only needs one for the initial pull, since that runs before `startSync` is ever wired up.
 
 - [ ] **Step 4: Run tests**
 
@@ -2167,8 +2172,10 @@ import type { MachineState } from '../types'
 import { blankState } from '../lib/calc'
 import { machines } from '../data'
 import { enqueue, getAllStates, isDirty, putState } from '../lib/db'
-import { drainOutbox, pullAll, startSync } from '../lib/sync'
+import { drainOutbox, pullAll, refreshPending, startSync } from '../lib/sync'
 import type { FieldGroup } from '../lib/db'
+
+const GROUPS: FieldGroup[] = ['inspection', 'commercial', 'decision']
 
 function seed(partial: Record<number, MachineState>): Record<number, MachineState> {
   return Object.fromEntries(
@@ -2179,7 +2186,8 @@ function seed(partial: Record<number, MachineState>): Record<number, MachineStat
 export function useAllMachineStates(canWrite: boolean) {
   const [states, setStates] = useState<Record<number, MachineState>>(() => seed({}))
   const [ready, setReady] = useState(false)
-  const dirtyRef = useRef<Set<string>>(new Set())
+  const statesRef = useRef(states)
+  useEffect(() => { statesRef.current = states }, [states])
 
   // Boot: local cache first (instant, works offline), then the server.
   useEffect(() => {
@@ -2190,10 +2198,16 @@ export function useAllMachineStates(canWrite: boolean) {
       try {
         const remote = await pullAll()
         if (cancelled) return
-        for (const [lot, state] of Object.entries(remote)) {
-          // Never overwrite a lot with unsent local edits.
-          if (dirtyRef.current.has(`${lot}:inspection`)) continue
-          await putState(Number(lot), state)
+        // The outbox is the durable record of unsynced work - an in-memory
+        // dirty flag would be empty after a reload, and pulling would then
+        // overwrite an inspector's offline edits. Guard every group, not
+        // just 'inspection': a dirty commercial or decision edit is just as
+        // real, and the server would otherwise clobber it.
+        for (const [lotKey, state] of Object.entries(remote)) {
+          const lot = Number(lotKey)
+          const dirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
+          if (dirty.some(Boolean)) continue
+          await putState(lot, state)
         }
         setStates(seed({ ...(await getAllStates()) }))
       } catch { /* offline: the local cache stands */ }
@@ -2201,39 +2215,39 @@ export function useAllMachineStates(canWrite: boolean) {
     return () => { cancelled = true }
   }, [])
 
-  // Realtime: apply inbound rows unless the lot is locally dirty.
-  useEffect(() => startSync(async (lot, remote) => {
-    const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
-    const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
-    if (dirty.some(Boolean)) return
+  // Realtime: sync.ts (Task 9) already guards against overwriting a dirty
+  // lot before it ever calls this, so it only needs to apply what it's given.
+  useEffect(() => startSync((lot, remote) => {
     setStates(prev => ({ ...prev, [lot]: { ...blankState(), ...remote } }))
   }), [])
 
   const patchState = useCallback((lot: number, group: FieldGroup, fn: (s: MachineState) => MachineState) => {
     if (!canWrite) return
     const updatedAt = new Date().toISOString()
+    // Computed from a ref, not inside the setStates updater: React may invoke
+    // that updater twice under StrictMode, and putState/enqueue must not fire twice.
+    const next = fn(statesRef.current[lot] ?? blankState())
+    const payload =
+      group === 'inspection' ? next.inspection :
+      group === 'commercial' ? next.commercial :
+      { decision: next.decision, shortlist: next.shortlist }
 
-    setStates(prev => {
-      const next = fn(prev[lot] ?? blankState())
-      const payload =
-        group === 'inspection' ? next.inspection :
-        group === 'commercial' ? next.commercial :
-        { decision: next.decision, shortlist: next.shortlist }
+    setStates(prev => ({ ...prev, [lot]: next }))
 
-      dirtyRef.current.add(`${lot}:${group}`)
-      // Fire-and-forget: the UI must not wait on storage or the network.
-      void putState(lot, next)
-      void enqueue({ lot, group, payload, updatedAt })
-        .then(() => { if (navigator.onLine) return drainOutbox() })
-        .finally(() => dirtyRef.current.delete(`${lot}:${group}`))
-
-      return { ...prev, [lot]: next }
-    })
+    // Fire-and-forget: the UI must never wait on storage or the network.
+    // db.ts reports failures via onStorageError, so these catches only swallow.
+    void putState(lot, next).catch(() => {})
+    void enqueue({ lot, group, payload, updatedAt })
+      .then(() => refreshPending())
+      .then(() => { if (navigator.onLine) return drainOutbox() })
+      .catch(() => {})
   }, [canWrite])
 
   return { states, ready, patchState }
 }
 ```
+
+`refreshPending()` runs unconditionally as soon as `enqueue` resolves, before the online check — an offline edit must still update `sync.pending`, or `SignOut`'s guard (Task 11 / `SignOut.tsx`) will read a stale 0 and never arm.
 
 - [ ] **Step 2: Create `src/components/SyncBadge.tsx`**
 

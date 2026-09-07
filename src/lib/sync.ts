@@ -1,5 +1,5 @@
 import { supabase } from './supabase'
-import { dequeue, listOutbox, putState, type FieldGroup } from './db'
+import { dequeue, isDirty, listOutbox, putState, type FieldGroup } from './db'
 import { blankState } from './calc'
 import type { MachineState } from '../types'
 
@@ -101,6 +101,12 @@ export async function pullAll(): Promise<Record<number, MachineState>> {
 /**
  * Starts background sync: drains on reconnect and on an interval, and applies
  * inbound realtime rows. Returns a cleanup function.
+ *
+ * The dirty check lives here, not with the caller: the outbox is the durable
+ * record of unsynced local edits (it survives reloads, unlike any in-memory
+ * flag), and both the cache write (putState) and the caller's callback must
+ * be gated on it - a dirty lot's local cache must never be clobbered even if
+ * the caller only guards its own copy.
  */
 export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
   const online  = () => { void refreshPending().then(() => drainOutbox()) }
@@ -118,6 +124,11 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
         async (payload: any) => {
           const row: any = payload.new
           if (!row?.lot) return
+          // Never overwrite a lot with unsynced local edits - the outbox is the
+          // durable record of those, and it survives reloads.
+          const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+          const dirty = await Promise.all(groups.map(g => isDirty(row.lot, g)))
+          if (dirty.some(Boolean)) return
           const state = rowToState(row)
           await putState(row.lot, state)
           onRemoteState(row.lot, state)

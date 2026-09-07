@@ -1,18 +1,32 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
-const { rpc, fromMock } = vi.hoisted(() => ({ rpc: vi.fn(), fromMock: vi.fn() }))
+const { rpc, fromMock, channelHandlers } = vi.hoisted(() => ({
+  rpc: vi.fn(),
+  fromMock: vi.fn(),
+  channelHandlers: [] as ((payload: any) => any)[],
+}))
 vi.mock('../supabase', () => ({
   supabase: {
     rpc,
     from: fromMock,
-    channel: () => ({ on: () => ({ subscribe: () => ({}) }) }),
+    channel: () => ({
+      on: (_event: string, _filter: any, handler: (payload: any) => any) => {
+        channelHandlers.push(handler)
+        return { subscribe: () => ({}) }
+      },
+    }),
     removeChannel: vi.fn(),
   },
   ensureSession: vi.fn(async () => 'uid-1'),
 }))
 
-import { clearAll, enqueue, listOutbox } from '../db'
-import { drainOutbox, pullAll } from '../sync'
+vi.mock('../db', async () => {
+  const actual = await vi.importActual<typeof import('../db')>('../db')
+  return { ...actual, isDirty: vi.fn(actual.isDirty), putState: vi.fn(actual.putState) }
+})
+
+import { clearAll, enqueue, listOutbox, isDirty, putState } from '../db'
+import { drainOutbox, pullAll, startSync } from '../sync'
 
 beforeEach(() => {
   fromMock.mockReturnValue({ select: () => Promise.resolve({ data: [], error: null }) })
@@ -111,5 +125,39 @@ describe('pullAll', () => {
     expect(states[412].inspection.critical).toBeDefined()
     expect(Object.keys(states[412].inspection.scores).length).toBeGreaterThan(0)
     expect(Object.keys(states[412].inspection.critical).length).toBeGreaterThan(0)
+  })
+})
+
+describe('startSync realtime handler', () => {
+  beforeEach(() => {
+    channelHandlers.length = 0
+    vi.mocked(isDirty).mockReset()
+    vi.mocked(putState).mockClear()
+  })
+
+  const row = { lot: 412, inspection: {}, commercial: {}, decision: 'UNASSESSED', shortlist: false }
+
+  it('does not overwrite the cache or notify the caller when the lot is dirty', async () => {
+    vi.mocked(isDirty).mockResolvedValue(true)
+    const onRemoteState = vi.fn()
+    const cleanup = startSync(onRemoteState)
+
+    await channelHandlers[0]({ new: row })
+
+    expect(putState).not.toHaveBeenCalled()
+    expect(onRemoteState).not.toHaveBeenCalled()
+    cleanup()
+  })
+
+  it('applies the row and notifies the caller when the lot is clean', async () => {
+    vi.mocked(isDirty).mockResolvedValue(false)
+    const onRemoteState = vi.fn()
+    const cleanup = startSync(onRemoteState)
+
+    await channelHandlers[0]({ new: row })
+
+    expect(putState).toHaveBeenCalledWith(412, expect.any(Object))
+    expect(onRemoteState).toHaveBeenCalledWith(412, expect.any(Object))
+    cleanup()
   })
 })
