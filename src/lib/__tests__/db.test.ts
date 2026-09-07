@@ -1,9 +1,15 @@
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { blankState } from '../calc'
+import * as idbKeyval from 'idb-keyval'
 import {
   clearAll, getState, putState, getAllStates,
-  enqueue, listOutbox, dequeue, isDirty,
+  enqueue, listOutbox, dequeue, isDirty, onStorageError,
 } from '../db'
+
+vi.mock('idb-keyval', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('idb-keyval')>()
+  return { ...actual, get: actual.get, set: actual.set }
+})
 
 beforeEach(async () => { await clearAll() })
 
@@ -68,6 +74,8 @@ describe('outbox', () => {
 
   it('dequeues only when the timestamp still matches', async () => {
     await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await dequeue(412, 'inspection', '2026-09-07T10:00:05.000Z')
+    expect(await listOutbox()).toHaveLength(1)
     await dequeue(412, 'inspection', '2026-09-07T10:00:00.000Z')
     expect(await listOutbox()).toHaveLength(0)
   })
@@ -79,5 +87,32 @@ describe('outbox', () => {
     // the in-flight push completes and tries to clear the old version
     await dequeue(412, 'inspection', '2026-09-07T10:00:00.000Z')
     expect(await listOutbox()).toHaveLength(1)
+  })
+})
+
+describe('storage error reporting', () => {
+  it('notifies subscribers and re-throws when a write fails', async () => {
+    const setSpy = vi.spyOn(idbKeyval, 'set').mockRejectedValueOnce(new Error('QuotaExceededError'))
+    const messages: string[] = []
+    const unsub = onStorageError(m => messages.push(m))
+
+    await expect(putState(412, blankState())).rejects.toThrow('QuotaExceededError')
+    expect(messages).toHaveLength(1)
+    expect(messages[0]).toMatch(/storage is full/i)
+
+    unsub()
+    setSpy.mockRestore()
+  })
+
+  it('returns a safe empty value and does not throw when a read fails', async () => {
+    const getSpy = vi.spyOn(idbKeyval, 'get').mockRejectedValueOnce(new Error('boom'))
+    const messages: string[] = []
+    const unsub = onStorageError(m => messages.push(m))
+
+    await expect(getState(412)).resolves.toBeNull()
+    expect(messages).toHaveLength(1)
+
+    unsub()
+    getSpy.mockRestore()
   })
 })

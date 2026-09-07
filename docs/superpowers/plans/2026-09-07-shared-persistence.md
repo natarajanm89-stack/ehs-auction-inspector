@@ -1675,6 +1675,8 @@ describe('outbox', () => {
 
   it('dequeues only when the timestamp still matches', async () => {
     await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await dequeue(412, 'inspection', '2026-09-07T10:00:05.000Z')
+    expect(await listOutbox()).toHaveLength(1)
     await dequeue(412, 'inspection', '2026-09-07T10:00:00.000Z')
     expect(await listOutbox()).toHaveLength(0)
   })
@@ -1703,9 +1705,12 @@ Expected: FAIL — `Failed to resolve import "../db"`.
 import { get, set, del, keys, createStore } from 'idb-keyval'
 import type { MachineState } from '../types'
 
-const stateStore  = createStore('ehs-inspector', 'states')
-const outboxStore = createStore('ehs-inspector', 'outbox')
-const photoStore  = createStore('ehs-inspector', 'photos')
+// Each store gets its own IndexedDB database. idb-keyval's createStore opens
+// its db without a version bump, so multiple stores sharing one db name only
+// ever get the first store created (the others silently 404 on later opens).
+const stateStore  = createStore('ehs-inspector-states', 'states')
+const outboxStore = createStore('ehs-inspector-outbox', 'outbox')
+const photoStore  = createStore('ehs-inspector-photos', 'photos')
 
 export type FieldGroup = 'inspection' | 'commercial' | 'decision'
 
@@ -1713,67 +1718,149 @@ export interface OutboxEntry {
   lot: number
   group: FieldGroup
   payload: unknown
+  // Must be `new Date().toISOString()` output - UTC with a `Z` suffix and
+  // millisecond precision. Collapsing and dequeue-guard logic below compares
+  // these values lexicographically; a local-offset timestamp would sort
+  // wrongly. On an exact tie the newer entry intentionally wins (the guard
+  // is `>`, not `>=`) - a same-millisecond re-edit should overwrite.
   updatedAt: string   // ISO 8601
 }
 
 const outboxKey = (lot: number, group: FieldGroup) => `${lot}:${group}`
 
+type StorageErrorListener = (message: string) => void
+const storageErrorListeners = new Set<StorageErrorListener>()
+
+/**
+ * Storage failures are not recoverable in place - quota exceeded, private
+ * browsing, a blocked upgrade - but the user must be told, because the
+ * local copy is the source of truth and a silent failure loses their work.
+ */
+export function onStorageError(fn: StorageErrorListener): () => void {
+  storageErrorListeners.add(fn)
+  return () => { storageErrorListeners.delete(fn) }
+}
+
+function reportStorageError(op: string, err: unknown): void {
+  const detail = err instanceof Error ? err.message : String(err)
+  const message =
+    detail.toLowerCase().includes('quota')
+      ? 'Device storage is full. Export your session and clear photos to continue saving.'
+      : `Could not save to this device (${op}). Your last change may not be stored.`
+  storageErrorListeners.forEach(fn => fn(message))
+}
+
 export async function getState(lot: number): Promise<MachineState | null> {
-  return (await get<MachineState>(String(lot), stateStore)) ?? null
+  try {
+    return (await get<MachineState>(String(lot), stateStore)) ?? null
+  } catch (err) {
+    reportStorageError('getState', err)
+    return null
+  }
 }
 
 export async function putState(lot: number, state: MachineState): Promise<void> {
-  await set(String(lot), state, stateStore)
+  try {
+    await set(String(lot), state, stateStore)
+  } catch (err) {
+    reportStorageError('putState', err)
+    throw err
+  }
 }
 
 export async function getAllStates(): Promise<Record<number, MachineState>> {
-  const all: Record<number, MachineState> = {}
-  for (const k of await keys(stateStore)) {
-    const s = await get<MachineState>(k as string, stateStore)
-    if (s) all[Number(k)] = s
+  try {
+    const all: Record<number, MachineState> = {}
+    for (const k of await keys(stateStore)) {
+      const s = await get<MachineState>(k as string, stateStore)
+      if (s) all[Number(k)] = s
+    }
+    return all
+  } catch (err) {
+    reportStorageError('getAllStates', err)
+    return {}
   }
-  return all
 }
 
 export async function enqueue(entry: OutboxEntry): Promise<void> {
-  const key = outboxKey(entry.lot, entry.group)
-  const existing = await get<OutboxEntry>(key, outboxStore)
-  // Collapse to the newest edit. An out-of-order enqueue must not win.
-  if (existing && existing.updatedAt > entry.updatedAt) return
-  await set(key, entry, outboxStore)
+  try {
+    const key = outboxKey(entry.lot, entry.group)
+    const existing = await get<OutboxEntry>(key, outboxStore)
+    // Collapse to the newest edit. An out-of-order enqueue must not win.
+    if (existing && existing.updatedAt > entry.updatedAt) return
+    await set(key, entry, outboxStore)
+  } catch (err) {
+    reportStorageError('enqueue', err)
+    throw err
+  }
 }
 
 export async function listOutbox(): Promise<OutboxEntry[]> {
-  const out: OutboxEntry[] = []
-  for (const k of await keys(outboxStore)) {
-    const e = await get<OutboxEntry>(k as string, outboxStore)
-    if (e) out.push(e)
+  try {
+    const out: OutboxEntry[] = []
+    for (const k of await keys(outboxStore)) {
+      const e = await get<OutboxEntry>(k as string, outboxStore)
+      if (e) out.push(e)
+    }
+    return out.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+  } catch (err) {
+    reportStorageError('listOutbox', err)
+    return []
   }
-  return out.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
 }
 
 /** Clears the entry only if it has not been superseded by a newer edit. */
 export async function dequeue(lot: number, group: FieldGroup, updatedAt: string): Promise<void> {
-  const key = outboxKey(lot, group)
-  const existing = await get<OutboxEntry>(key, outboxStore)
-  if (existing && existing.updatedAt === updatedAt) await del(key, outboxStore)
+  try {
+    const key = outboxKey(lot, group)
+    const existing = await get<OutboxEntry>(key, outboxStore)
+    if (existing && existing.updatedAt === updatedAt) await del(key, outboxStore)
+  } catch (err) {
+    reportStorageError('dequeue', err)
+    throw err
+  }
 }
 
 export async function isDirty(lot: number, group: FieldGroup): Promise<boolean> {
-  return (await get<OutboxEntry>(outboxKey(lot, group), outboxStore)) !== undefined
+  try {
+    return (await get<OutboxEntry>(outboxKey(lot, group), outboxStore)) !== undefined
+  } catch (err) {
+    reportStorageError('isDirty', err)
+    return false
+  }
 }
 
 export async function putPhotoBlob(id: string, blob: Blob): Promise<void> {
-  await set(id, blob, photoStore)
+  try {
+    await set(id, blob, photoStore)
+  } catch (err) {
+    reportStorageError('putPhotoBlob', err)
+    throw err
+  }
 }
 export async function getPhotoBlob(id: string): Promise<Blob | null> {
-  return (await get<Blob>(id, photoStore)) ?? null
+  try {
+    return (await get<Blob>(id, photoStore)) ?? null
+  } catch (err) {
+    reportStorageError('getPhotoBlob', err)
+    return null
+  }
 }
 export async function deletePhotoBlob(id: string): Promise<void> {
-  await del(id, photoStore)
+  try {
+    await del(id, photoStore)
+  } catch (err) {
+    reportStorageError('deletePhotoBlob', err)
+    throw err
+  }
 }
 export async function listPendingPhotos(): Promise<string[]> {
-  return (await keys(photoStore)).map(String)
+  try {
+    return (await keys(photoStore)).map(String)
+  } catch (err) {
+    reportStorageError('listPendingPhotos', err)
+    return []
+  }
 }
 
 /** Test helper. Also used by the "reset this device" action in Settings. */
@@ -1905,6 +1992,7 @@ Expected: FAIL — `Failed to resolve import "../sync"`.
 ```ts
 import { supabase } from './supabase'
 import { dequeue, listOutbox, putState, type FieldGroup } from './db'
+import { blankState } from './calc'
 import type { MachineState } from '../types'
 
 export type SyncStatus = 'synced' | 'pending' | 'offline' | 'error'
@@ -1943,20 +2031,32 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   let pushed = 0, failed = 0
 
   try {
-    for (const e of await listOutbox()) {
-      const { data, error } = await supabase.rpc('sync_machine_state', {
-        p_lot: e.lot,
-        p_group: e.group,
-        p_payload: e.payload,
-        p_client_updated_at: e.updatedAt,
-      })
+    // Re-check after each pass: edits made while a push was in flight would
+    // otherwise wait for the next interval tick, and the badge would read
+    // "synced" while an entry was still queued.
+    for (;;) {
+      const batch = await listOutbox()
+      if (batch.length === 0) break
+      let progressed = false
 
-      if (error) { failed++; continue }   // stays queued, retried later
-      // data === false means the server already holds a newer value.
-      // Our copy is stale; clearing it is correct, retrying is not.
-      await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
-      pushed++
-      void data
+      for (const e of batch) {
+        const { data, error } = await supabase.rpc('sync_machine_state', {
+          p_lot: e.lot,
+          p_group: e.group,
+          p_payload: e.payload,
+          p_client_updated_at: e.updatedAt,
+        })
+
+        if (error) { failed++; continue }   // stays queued, retried later
+        // data === false means the server already holds a newer value.
+        // Our copy is stale; clearing it is correct, retrying is not.
+        await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
+        pushed++
+        progressed = true
+        void data
+      }
+
+      if (!progressed) break   // every remaining entry failed; retry later
     }
   } finally {
     draining = false
@@ -1968,13 +2068,18 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   return { pushed, failed }
 }
 
+// The server stores {} for untouched lots' inspection/commercial columns, so
+// defaults must be merged in here rather than left to every consumer - a
+// shallow merge downstream (`{ ...blankState(), ...pulled }`) would replace
+// the whole default inspection object and drop `scores`/`critical`.
 function rowToState(row: any): MachineState {
+  const base = blankState()
   return {
-    inspection: row.inspection ?? {},
-    commercial: row.commercial ?? {},
-    decision: row.decision,
-    shortlist: row.shortlist,
-  } as MachineState
+    inspection: { ...base.inspection, ...(row.inspection ?? {}) },
+    commercial: { ...base.commercial, ...(row.commercial ?? {}) },
+    decision:   row.decision  ?? base.decision,
+    shortlist:  row.shortlist ?? base.shortlist,
+  }
 }
 
 export async function pullAll(): Promise<Record<number, MachineState>> {
@@ -2048,6 +2153,7 @@ Replaces the `useState(loadAll)` + `useEffect(localStorage.setItem)` pair at `sr
 
 **Interfaces:**
 - Consumes: `db.ts` (Task 8), `sync.ts` (Task 9), `blankState` (Task 2)
+- Note: `pullAll` (Task 9) always returns fully-defaulted `MachineState`s — `inspection`/`commercial` are merged against `blankState()`, so consumers do not need to re-merge defaults. Consumers should also subscribe to `onStorageError` (Task 8) to surface local storage failures (quota exceeded, private browsing, blocked upgrade) to the user, since a failed write is otherwise silent.
 - Produces:
   - `useAllMachineStates(canWrite: boolean)` returning
     `{ states: Record<number, MachineState>; ready: boolean; patchState(lot, group, fn): void }`

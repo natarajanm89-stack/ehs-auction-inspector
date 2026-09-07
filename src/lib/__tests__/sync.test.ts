@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest'
 
-const { rpc } = vi.hoisted(() => ({ rpc: vi.fn() }))
+const { rpc, fromMock } = vi.hoisted(() => ({ rpc: vi.fn(), fromMock: vi.fn() }))
 vi.mock('../supabase', () => ({
   supabase: {
     rpc,
-    from: () => ({ select: () => Promise.resolve({ data: [], error: null }) }),
+    from: fromMock,
     channel: () => ({ on: () => ({ subscribe: () => ({}) }) }),
     removeChannel: vi.fn(),
   },
@@ -12,7 +12,11 @@ vi.mock('../supabase', () => ({
 }))
 
 import { clearAll, enqueue, listOutbox } from '../db'
-import { drainOutbox } from '../sync'
+import { drainOutbox, pullAll } from '../sync'
+
+beforeEach(() => {
+  fromMock.mockReturnValue({ select: () => Promise.resolve({ data: [], error: null }) })
+})
 
 beforeEach(async () => { await clearAll(); rpc.mockReset() })
 
@@ -71,5 +75,41 @@ describe('drainOutbox', () => {
     await drainOutbox()
     await drainOutbox()
     expect(rpc).toHaveBeenCalledTimes(1)
+  })
+
+  it('pushes an entry enqueued during the same drain call, not the next one', async () => {
+    let calls = 0
+    rpc.mockImplementation(async () => {
+      calls++
+      // While the first entry is "in flight", a second edit gets queued.
+      if (calls === 1) {
+        await enqueue(entry(413, 'commercial', '2026-09-07T10:00:09.000Z'))
+      }
+      return { data: true, error: null }
+    })
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+
+    const result = await drainOutbox()
+
+    expect(result).toEqual({ pushed: 2, failed: 0 })
+    expect(await listOutbox()).toHaveLength(0)
+  })
+})
+
+describe('pullAll', () => {
+  it('fills in default inspection and commercial fields for untouched lots', async () => {
+    fromMock.mockReturnValue({
+      select: () => Promise.resolve({
+        data: [{ lot: 412, inspection: {}, commercial: {}, decision: 'UNASSESSED', shortlist: false }],
+        error: null,
+      }),
+    })
+
+    const states = await pullAll()
+
+    expect(states[412].inspection.scores).toBeDefined()
+    expect(states[412].inspection.critical).toBeDefined()
+    expect(Object.keys(states[412].inspection.scores).length).toBeGreaterThan(0)
+    expect(Object.keys(states[412].inspection.critical).length).toBeGreaterThan(0)
   })
 })

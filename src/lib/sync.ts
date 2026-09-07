@@ -1,5 +1,6 @@
 import { supabase } from './supabase'
 import { dequeue, listOutbox, putState, type FieldGroup } from './db'
+import { blankState } from './calc'
 import type { MachineState } from '../types'
 
 export type SyncStatus = 'synced' | 'pending' | 'offline' | 'error'
@@ -38,20 +39,32 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   let pushed = 0, failed = 0
 
   try {
-    for (const e of await listOutbox()) {
-      const { data, error } = await supabase.rpc('sync_machine_state', {
-        p_lot: e.lot,
-        p_group: e.group,
-        p_payload: e.payload,
-        p_client_updated_at: e.updatedAt,
-      })
+    // Re-check after each pass: edits made while a push was in flight would
+    // otherwise wait for the next interval tick, and the badge would read
+    // "synced" while an entry was still queued.
+    for (;;) {
+      const batch = await listOutbox()
+      if (batch.length === 0) break
+      let progressed = false
 
-      if (error) { failed++; continue }   // stays queued, retried later
-      // data === false means the server already holds a newer value.
-      // Our copy is stale; clearing it is correct, retrying is not.
-      await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
-      pushed++
-      void data
+      for (const e of batch) {
+        const { data, error } = await supabase.rpc('sync_machine_state', {
+          p_lot: e.lot,
+          p_group: e.group,
+          p_payload: e.payload,
+          p_client_updated_at: e.updatedAt,
+        })
+
+        if (error) { failed++; continue }   // stays queued, retried later
+        // data === false means the server already holds a newer value.
+        // Our copy is stale; clearing it is correct, retrying is not.
+        await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
+        pushed++
+        progressed = true
+        void data
+      }
+
+      if (!progressed) break   // every remaining entry failed; retry later
     }
   } finally {
     draining = false
@@ -63,13 +76,18 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   return { pushed, failed }
 }
 
+// The server stores {} for untouched lots' inspection/commercial columns, so
+// defaults must be merged in here rather than left to every consumer - a
+// shallow merge downstream (`{ ...blankState(), ...pulled }`) would replace
+// the whole default inspection object and drop `scores`/`critical`.
 function rowToState(row: any): MachineState {
+  const base = blankState()
   return {
-    inspection: row.inspection ?? {},
-    commercial: row.commercial ?? {},
-    decision: row.decision,
-    shortlist: row.shortlist,
-  } as MachineState
+    inspection: { ...base.inspection, ...(row.inspection ?? {}) },
+    commercial: { ...base.commercial, ...(row.commercial ?? {}) },
+    decision:   row.decision  ?? base.decision,
+    shortlist:  row.shortlist ?? base.shortlist,
+  }
 }
 
 export async function pullAll(): Promise<Record<number, MachineState>> {
