@@ -11,6 +11,17 @@ interface Comment {
   created_at: string
 }
 
+/**
+ * Opening a thread writes a comment_reads row, but that write raises no
+ * realtime event, so the badge would keep showing a stale count until the next
+ * comment posted anywhere. This tells the badge directly.
+ */
+const readListeners = new Set<(lot: number) => void>()
+
+function notifyRead(lot: number): void {
+  readListeners.forEach(fn => fn(lot))
+}
+
 export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
   const [items, setItems] = useState<Comment[]>([])
   const [draft, setDraft] = useState('')
@@ -22,6 +33,7 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
     setItems((data ?? []) as Comment[])
     await supabase.from('comment_reads')
       .upsert({ profile_id: profile.id, lot, last_read_at: new Date().toISOString() })
+    notifyRead(lot)
   }, [lot, profile.id])
 
   useEffect(() => { void load() }, [load])
@@ -30,13 +42,21 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
     const channel = supabase.channel(`comments_${lot}`)
       .on('postgres_changes',
           { event: 'INSERT', schema: 'ehs', table: 'comments', filter: `lot=eq.${lot}` },
-          payload => setItems(prev =>
-            prev.some(c => c.id === (payload.new as Comment).id)
-              ? prev
-              : [...prev, payload.new as Comment]))
+          payload => {
+            setItems(prev =>
+              prev.some(c => c.id === (payload.new as Comment).id)
+                ? prev
+                : [...prev, payload.new as Comment])
+            // The thread is open and visible, so a comment arriving for this
+            // lot right now has effectively been seen — mark it read again
+            // rather than letting the badge count it as unread.
+            void supabase.from('comment_reads')
+              .upsert({ profile_id: profile.id, lot, last_read_at: new Date().toISOString() })
+              .then(() => notifyRead(lot))
+          })
       .subscribe()
     return () => { void supabase.removeChannel(channel) }
-  }, [lot])
+  }, [lot, profile.id])
 
   const post = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -98,12 +118,20 @@ export function useUnreadCounts(profileId: string): Record<number, number> {
     }
     void compute()
 
+    const onRead = (lot: number) => {
+      setCounts(prev => (prev[lot] ? { ...prev, [lot]: 0 } : prev))
+    }
+    readListeners.add(onRead)
+
     const channel = supabase.channel('comments_unread')
       .on('postgres_changes',
           { event: 'INSERT', schema: 'ehs', table: 'comments' },
           () => { void compute() })
       .subscribe()
-    return () => { void supabase.removeChannel(channel) }
+    return () => {
+      readListeners.delete(onRead)
+      void supabase.removeChannel(channel)
+    }
   }, [profileId])
 
   return counts
