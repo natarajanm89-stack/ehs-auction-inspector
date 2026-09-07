@@ -246,3 +246,12 @@ td select { min-width:110px; padding:7px; }
   .commercial-form .two-col { grid-template-columns:1fr; }
   .decision-metrics { grid-template-columns:repeat(3,1fr); }
 }
+
+.gate { min-height: 100dvh; display: grid; place-items: center; padding: 24px; }
+.gate-card { width: min(380px, 100%); display: grid; gap: 14px; padding: 28px;
+  border-radius: 16px; background: #fff; box-shadow: 0 10px 40px rgba(0,0,0,.12); }
+.gate-card h1 { margin: 0; font-size: 22px; }
+.gate-card label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
+.gate-card input { padding: 11px 12px; border: 1px solid #d6dae2; border-radius: 9px;
+  font-size: 16px; }
+.gate-error { margin: 0; color: #b42318; font-size: 13px; }

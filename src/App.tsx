@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import { CATEGORY_COUNTS, EVENT, INSPECTION_SECTIONS, CRITICAL_CHECKS, machines } from './data'
 import type { Decision, Machine, MachineState } from './types'
 import { autoDecision, blankState, calc } from './lib/calc'
+import type { Profile } from './lib/profile'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'settings'
 
@@ -27,7 +28,7 @@ function ScoreBar({ value }: { value: number }) {
   return <div className="scorebar"><div style={{ width: `${Math.min(100, value)}%` }} /></div>
 }
 
-function App() {
+function App({ profile }: { profile: Profile }) {
   const [tab, setTab] = useState<Tab>('dashboard')
   const [states, setStates] = useState<Record<number, MachineState>>(loadAll)
   const [selectedLot, setSelectedLot] = useState<number>(machines[0].lot)
