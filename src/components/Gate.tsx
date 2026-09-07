@@ -2,6 +2,23 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { ensureSession } from '../lib/supabase'
 import { cachedProfile, cacheProfile, fetchProfile, redeemCode, type Profile } from '../lib/profile'
 
+// profile.ts throws human-readable messages for the cases it recognises, but a
+// genuinely unexpected failure (an RPC/Postgres error it didn't map) still
+// surfaces its raw driver message. Inspectors reading this are on phones in
+// an auction yard, not developers, so anything that looks like a raw
+// database/driver string gets swapped for a plain-language fallback.
+function looksLikeRawDbError(message: string): boolean {
+  const m = message.toLowerCase()
+  return /violates|constraint|relation|column|syntax error|pg_|postgrest|\b\d{5}\b/.test(m)
+}
+
+function readableRedeemError(err: unknown): string {
+  if (err instanceof Error && err.message && !looksLikeRawDbError(err.message)) {
+    return err.message
+  }
+  return 'Something went wrong verifying that code. Please try again.'
+}
+
 export function Gate({ children }: { children: (profile: Profile) => React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [booting, setBooting] = useState(true)
@@ -59,7 +76,7 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
       await redeemCode(code, name)
       setProfile(await fetchProfile())
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Could not verify that code.')
+      setError(readableRedeemError(err))
     } finally {
       submitting.current = false
       setBusy(false)

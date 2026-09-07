@@ -35,6 +35,17 @@ export function ensureSession(): Promise<string> {
   return sessionPromise
 }
 
+/**
+ * Drops any in-flight/memoized session promise so the next ensureSession()
+ * call genuinely re-derives the identity instead of handing back a cached
+ * one. Needed after an explicit signOut() - without this, a caller that
+ * signed out and immediately called ensureSession() could still receive an
+ * id from a bootstrap that started (and was memoized) before the sign-out.
+ */
+export function resetSession(): void {
+  sessionPromise = null
+}
+
 // getSession() in supabase-js v2 refreshes an expired session itself and returns
 // null if the refresh token has been revoked, so a revoked session falls through
 // to a fresh anonymous sign-in below.

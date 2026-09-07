@@ -1,4 +1,4 @@
-import { supabase } from './supabase'
+import { supabase, ensureSession, resetSession } from './supabase'
 
 export type Role = 'admin' | 'inspector' | 'viewer'
 
@@ -71,14 +71,48 @@ export async function fetchProfile(): Promise<Profile | null> {
   return result
 }
 
-export async function redeemCode(code: string, displayName: string): Promise<Role> {
-  const { data, error } = await supabase.rpc('redeem_access_code', {
-    p_code: code.trim(),
-    p_display_name: displayName.trim(),
-  })
-  if (error) throw new Error(error.message)
+function isStaleSessionError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false
+  if (error.code === '23503') return true
+  // Defensive fallback: postgrest error shapes vary, so also match on message.
+  const msg = (error.message ?? '').toLowerCase()
+  return msg.includes('foreign key') && msg.includes('profiles')
+}
+
+function mapRedeemResult(data: unknown): Role {
   if (data === 'invalid_code') throw new Error('That access code is not recognised.')
   if (data === 'rate_limited') throw new Error('Too many attempts. Wait 15 minutes and try again.')
   if (data === 'admin' || data === 'inspector' || data === 'viewer') return data
   throw new Error('Unexpected response from the server. Try again.')
+}
+
+export async function redeemCode(code: string, displayName: string): Promise<Role> {
+  const params = { p_code: code.trim(), p_display_name: displayName.trim() }
+  const { data, error } = await supabase.rpc('redeem_access_code', params)
+
+  if (error) {
+    // An operator deleting a user's auth.users row is the *documented* way to
+    // revoke access in this app (identities are per-device and anonymous, so
+    // there is no account to disable). Without this recovery, the device that
+    // held that session is bricked: the anon session token in localStorage
+    // still "looks" valid to the client, but every insert against `profiles`
+    // fails its FK constraint, and re-entering the code fails identically
+    // forever. Recognise that case and self-heal once: drop the dead session,
+    // mint a fresh anonymous identity, and retry the redemption.
+    if (isStaleSessionError(error)) {
+      const { error: signOutError } = await supabase.auth.signOut()
+      if (signOutError) throw new Error('Could not refresh your session. Try again.')
+      resetSession()
+      await ensureSession()
+
+      const retry = await supabase.rpc('redeem_access_code', params)
+      if (retry.error) {
+        throw new Error('Your session could not be renewed. Please try again.')
+      }
+      return mapRedeemResult(retry.data)
+    }
+    throw new Error(error.message)
+  }
+
+  return mapRedeemResult(data)
 }
