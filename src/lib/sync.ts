@@ -15,6 +15,13 @@ let snapshot: SyncSnapshot = { status: 'synced', pending: 0, lastSyncedAt: null 
 const listeners = new Set<(s: SyncSnapshot) => void>()
 let draining = false
 
+// Lots skipped by the realtime handler because they were dirty at the time -
+// they need a follow-up pull once their outbox entries have cleared, since
+// nothing else re-fetches them and pullAll only runs once at boot.
+const pendingPull = new Set<number>()
+const PENDING_PULL_LIMIT = 50
+let currentOnRemoteState: ((lot: number, state: MachineState) => void) | null = null
+
 export function subscribeStatus(fn: (s: SyncSnapshot) => void): () => void {
   listeners.add(fn)
   fn(snapshot)
@@ -73,7 +80,55 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   await refreshPending()
   if (pushed && !failed) emit({ lastSyncedAt: new Date().toISOString() })
   if (failed) emit({ status: navigator.onLine ? 'error' : 'offline' })
+
+  // Reconcile lots the realtime handler skipped while they were dirty. Only
+  // once the outbox is fully drained (empty), otherwise a lot could still be
+  // mid-push and we'd race with it.
+  if ((await listOutbox()).length === 0 && pendingPull.size > 0) {
+    await reconcilePending()
+  }
+
   return { pushed, failed }
+}
+
+async function reconcilePending(): Promise<void> {
+  if (pendingPull.size > PENDING_PULL_LIMIT) {
+    // Cheaper to just refetch everything than track hundreds of rows.
+    const lots = [...pendingPull]
+    pendingPull.clear()
+    try {
+      const remote = await pullAll()
+      for (const lot of lots) {
+        const state = remote[lot]
+        if (!state) continue
+        await putState(lot, state)
+        currentOnRemoteState?.(lot, state)
+      }
+    } catch { /* offline: try again on the next drain */ }
+    return
+  }
+
+  for (const lot of [...pendingPull]) {
+    const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+    const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
+    if (dirty.some(Boolean)) continue // still dirty: leave queued, retry next time
+
+    const state = await pullLot(lot)
+    pendingPull.delete(lot)
+    if (!state) continue
+    await putState(lot, state)
+    currentOnRemoteState?.(lot, state)
+  }
+}
+
+export async function pullLot(lot: number): Promise<MachineState | null> {
+  const { data, error } = await supabase
+    .from('machine_states')
+    .select('*')
+    .eq('lot', lot)
+    .maybeSingle()
+  if (error || !data) return null
+  return rowToState(data)
 }
 
 // The server stores {} for untouched lots' inspection/commercial columns, so
@@ -109,6 +164,7 @@ export async function pullAll(): Promise<Record<number, MachineState>> {
  * the caller only guards its own copy.
  */
 export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
+  currentOnRemoteState = onRemoteState
   const online  = () => { void refreshPending().then(() => drainOutbox()) }
   const offline = () => emit({ status: 'offline' })
 
@@ -128,7 +184,13 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
           // durable record of those, and it survives reloads.
           const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
           const dirty = await Promise.all(groups.map(g => isDirty(row.lot, g)))
-          if (dirty.some(Boolean)) return
+          if (dirty.some(Boolean)) {
+            if (pendingPull.size >= PENDING_PULL_LIMIT) {
+              pendingPull.clear()
+            }
+            pendingPull.add(row.lot)
+            return
+          }
           const state = rowToState(row)
           await putState(row.lot, state)
           onRemoteState(row.lot, state)
@@ -142,5 +204,7 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
     window.removeEventListener('offline', offline)
     window.clearInterval(timer)
     void supabase.removeChannel(channel)
+    currentOnRemoteState = null
+    pendingPull.clear()
   }
 }

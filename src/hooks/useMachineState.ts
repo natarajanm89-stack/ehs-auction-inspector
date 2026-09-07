@@ -19,6 +19,11 @@ export function useAllMachineStates(canWrite: boolean) {
   const [ready, setReady] = useState(false)
   const statesRef = useRef(states)
   useEffect(() => { statesRef.current = states }, [states])
+  // Lots edited in this session - the boot pull must never overwrite one of
+  // these regardless of what the outbox says at any given instant, since an
+  // edit made between the isDirty check and the putState below would
+  // otherwise be silently reverted.
+  const touchedRef = useRef<Set<number>>(new Set())
 
   // Boot: local cache first (instant, works offline), then the server.
   useEffect(() => {
@@ -34,8 +39,14 @@ export function useAllMachineStates(canWrite: boolean) {
         // inspector's offline edits.
         for (const [lotKey, state] of Object.entries(remote)) {
           const lot = Number(lotKey)
+          if (touchedRef.current.has(lot)) continue
           const dirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
           if (dirty.some(Boolean)) continue
+          // Narrow the window further: re-check immediately before the write
+          // in case an edit landed while the first check was in flight.
+          if (touchedRef.current.has(lot)) continue
+          const stillDirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
+          if (stillDirty.some(Boolean)) continue
           await putState(lot, state)
         }
         setStates(seed({ ...(await getAllStates()) }))
@@ -52,6 +63,7 @@ export function useAllMachineStates(canWrite: boolean) {
 
   const patchState = useCallback((lot: number, group: FieldGroup, fn: (s: MachineState) => MachineState) => {
     if (!canWrite) return
+    touchedRef.current.add(lot)
     const updatedAt = new Date().toISOString()
     const next = fn(statesRef.current[lot] ?? blankState())
     const payload =

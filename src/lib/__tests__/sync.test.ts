@@ -26,7 +26,7 @@ vi.mock('../db', async () => {
 })
 
 import { clearAll, enqueue, listOutbox, isDirty, putState } from '../db'
-import { drainOutbox, pullAll, startSync } from '../sync'
+import { drainOutbox, pullAll, pullLot, startSync } from '../sync'
 
 beforeEach(() => {
   fromMock.mockReturnValue({ select: () => Promise.resolve({ data: [], error: null }) })
@@ -158,6 +158,43 @@ describe('startSync realtime handler', () => {
 
     expect(putState).toHaveBeenCalledWith(412, expect.any(Object))
     expect(onRemoteState).toHaveBeenCalledWith(412, expect.any(Object))
+    cleanup()
+  })
+
+  it('queues a dirty lot for reconciliation instead of dropping it', async () => {
+    vi.mocked(isDirty).mockResolvedValue(true)
+    const onRemoteState = vi.fn()
+    const cleanup = startSync(onRemoteState)
+
+    await channelHandlers[0]({ new: row })
+    expect(onRemoteState).not.toHaveBeenCalled()
+
+    // Now the lot is clean and the outbox is empty: draining should reconcile it.
+    vi.mocked(isDirty).mockResolvedValue(false)
+    fromMock.mockReturnValue({
+      select: () => ({
+        eq: () => ({
+          maybeSingle: () => Promise.resolve({ data: row, error: null }),
+        }),
+      }),
+    })
+    await drainOutbox()
+
+    expect(putState).toHaveBeenCalledWith(412, expect.any(Object))
+    expect(onRemoteState).toHaveBeenCalledWith(412, expect.any(Object))
+    cleanup()
+  })
+
+  it('leaves a lot still dirty at reconcile time queued for the next attempt', async () => {
+    vi.mocked(isDirty).mockResolvedValue(true)
+    const onRemoteState = vi.fn()
+    const cleanup = startSync(onRemoteState)
+
+    await channelHandlers[0]({ new: row })
+    await drainOutbox()
+
+    expect(putState).not.toHaveBeenCalled()
+    expect(onRemoteState).not.toHaveBeenCalled()
     cleanup()
   })
 })

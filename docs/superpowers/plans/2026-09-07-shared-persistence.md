@@ -2007,6 +2007,13 @@ let snapshot: SyncSnapshot = { status: 'synced', pending: 0, lastSyncedAt: null 
 const listeners = new Set<(s: SyncSnapshot) => void>()
 let draining = false
 
+// Lots skipped by the realtime handler because they were dirty at the time -
+// they need a follow-up pull once their outbox entries have cleared, since
+// nothing else re-fetches them and pullAll only runs once at boot.
+const pendingPull = new Set<number>()
+const PENDING_PULL_LIMIT = 50
+let currentOnRemoteState: ((lot: number, state: MachineState) => void) | null = null
+
 export function subscribeStatus(fn: (s: SyncSnapshot) => void): () => void {
   listeners.add(fn)
   fn(snapshot)
@@ -2065,7 +2072,55 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   await refreshPending()
   if (pushed && !failed) emit({ lastSyncedAt: new Date().toISOString() })
   if (failed) emit({ status: navigator.onLine ? 'error' : 'offline' })
+
+  // Reconcile lots the realtime handler skipped while they were dirty. Only
+  // once the outbox is fully drained (empty), otherwise a lot could still be
+  // mid-push and we'd race with it.
+  if ((await listOutbox()).length === 0 && pendingPull.size > 0) {
+    await reconcilePending()
+  }
+
   return { pushed, failed }
+}
+
+async function reconcilePending(): Promise<void> {
+  if (pendingPull.size > PENDING_PULL_LIMIT) {
+    // Cheaper to just refetch everything than track hundreds of rows.
+    const lots = [...pendingPull]
+    pendingPull.clear()
+    try {
+      const remote = await pullAll()
+      for (const lot of lots) {
+        const state = remote[lot]
+        if (!state) continue
+        await putState(lot, state)
+        currentOnRemoteState?.(lot, state)
+      }
+    } catch { /* offline: try again on the next drain */ }
+    return
+  }
+
+  for (const lot of [...pendingPull]) {
+    const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+    const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
+    if (dirty.some(Boolean)) continue // still dirty: leave queued, retry next time
+
+    const state = await pullLot(lot)
+    pendingPull.delete(lot)
+    if (!state) continue
+    await putState(lot, state)
+    currentOnRemoteState?.(lot, state)
+  }
+}
+
+export async function pullLot(lot: number): Promise<MachineState | null> {
+  const { data, error } = await supabase
+    .from('machine_states')
+    .select('*')
+    .eq('lot', lot)
+    .maybeSingle()
+  if (error || !data) return null
+  return rowToState(data)
 }
 
 // The server stores {} for untouched lots' inspection/commercial columns, so
@@ -2095,6 +2150,7 @@ export async function pullAll(): Promise<Record<number, MachineState>> {
  * inbound realtime rows. Returns a cleanup function.
  */
 export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
+  currentOnRemoteState = onRemoteState
   const online  = () => { void refreshPending().then(() => drainOutbox()) }
   const offline = () => emit({ status: 'offline' })
 
@@ -2114,7 +2170,13 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
           // durable record of those, and it survives reloads.
           const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
           const dirty = await Promise.all(groups.map(g => isDirty(row.lot, g)))
-          if (dirty.some(Boolean)) return
+          if (dirty.some(Boolean)) {
+            if (pendingPull.size >= PENDING_PULL_LIMIT) {
+              pendingPull.clear()
+            }
+            pendingPull.add(row.lot)
+            return
+          }
           const state = rowToState(row)
           await putState(row.lot, state)
           onRemoteState(row.lot, state)
@@ -2128,16 +2190,20 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
     window.removeEventListener('offline', offline)
     window.clearInterval(timer)
     void supabase.removeChannel(channel)
+    currentOnRemoteState = null
+    pendingPull.clear()
   }
 }
 ```
 
 The dirty check lives here, not with the caller: the outbox (`isDirty` from `db.ts`) is the durable record of unsynced local edits — it survives reloads, unlike any in-memory flag — and both the cache write (`putState`) and the caller's `onRemoteState` callback must be gated on it. `useMachineState` (Task 10) therefore no longer needs its own dirty check for realtime rows; it only needs one for the initial pull, since that runs before `startSync` is ever wired up.
 
+A lot that is skipped because it is dirty is not simply dropped: it is queued in `pendingPull` and reconciled the next time `drainOutbox` finishes a pass with an empty outbox, by pulling that single row (`pullLot`), applying it, and firing `onRemoteState` — so a realtime update that arrives mid-edit is not lost, only delayed until the local edit has synced. `pendingPull` is capped at `PENDING_PULL_LIMIT` (50) to bound memory; past that it is cleared and a full `pullAll`-style reconcile is done instead.
+
 - [ ] **Step 4: Run tests**
 
 Run: `npm test -- sync`
-Expected: PASS, 6 tests.
+Expected: PASS, 9 tests (6 original + 3 covering realtime dirty-skip, dirty-clean apply, and pending-pull reconciliation).
 
 - [ ] **Step 5: Commit**
 
@@ -2188,6 +2254,11 @@ export function useAllMachineStates(canWrite: boolean) {
   const [ready, setReady] = useState(false)
   const statesRef = useRef(states)
   useEffect(() => { statesRef.current = states }, [states])
+  // Lots edited in this session - the boot pull must never overwrite one of
+  // these regardless of what the outbox says at any given instant, since an
+  // edit made between the isDirty check and the putState below would
+  // otherwise be silently reverted.
+  const touchedRef = useRef<Set<number>>(new Set())
 
   // Boot: local cache first (instant, works offline), then the server.
   useEffect(() => {
@@ -2205,8 +2276,14 @@ export function useAllMachineStates(canWrite: boolean) {
         // real, and the server would otherwise clobber it.
         for (const [lotKey, state] of Object.entries(remote)) {
           const lot = Number(lotKey)
+          if (touchedRef.current.has(lot)) continue
           const dirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
           if (dirty.some(Boolean)) continue
+          // Narrow the window further: re-check immediately before the write
+          // in case an edit landed while the first check was in flight.
+          if (touchedRef.current.has(lot)) continue
+          const stillDirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
+          if (stillDirty.some(Boolean)) continue
           await putState(lot, state)
         }
         setStates(seed({ ...(await getAllStates()) }))
@@ -2223,6 +2300,7 @@ export function useAllMachineStates(canWrite: boolean) {
 
   const patchState = useCallback((lot: number, group: FieldGroup, fn: (s: MachineState) => MachineState) => {
     if (!canWrite) return
+    touchedRef.current.add(lot)
     const updatedAt = new Date().toISOString()
     // Computed from a ref, not inside the setStates updater: React may invoke
     // that updater twice under StrictMode, and putState/enqueue must not fire twice.
