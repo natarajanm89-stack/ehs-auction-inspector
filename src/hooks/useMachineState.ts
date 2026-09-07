@@ -24,6 +24,13 @@ export function useAllMachineStates(canWrite: boolean) {
   // edit made between the isDirty check and the putState below would
   // otherwise be silently reverted.
   const touchedRef = useRef<Set<number>>(new Set())
+  // Tracks the latest value written by patchState per lot, updated
+  // synchronously. React applies functional setState updates during its own
+  // render pass, not necessarily synchronously with the call, so two
+  // patchState calls made in the same tick cannot rely on reading each
+  // other's result back out of `states`/`statesRef` - this ref is the
+  // synchronous source of truth instead.
+  const draftRef = useRef<Record<number, MachineState>>({})
 
   // Boot: local cache first (instant, works offline), then the server.
   useEffect(() => {
@@ -49,7 +56,17 @@ export function useAllMachineStates(canWrite: boolean) {
           if (stillDirty.some(Boolean)) continue
           await putState(lot, state)
         }
-        setStates(seed({ ...(await getAllStates()) }))
+        const fresh = await getAllStates()
+        setStates(prev => {
+          const merged = seed(fresh)
+          // A lot touched in this session must keep its in-memory value: the
+          // edit may not have reached IndexedDB yet, and overwriting it here
+          // would also poison statesRef for the next keystroke.
+          for (const lot of touchedRef.current) {
+            if (prev[lot]) merged[lot] = prev[lot]
+          }
+          return merged
+        })
       } catch { /* offline: the local cache stands */ }
     })()
     return () => { cancelled = true }
@@ -65,13 +82,20 @@ export function useAllMachineStates(canWrite: boolean) {
     if (!canWrite) return
     touchedRef.current.add(lot)
     const updatedAt = new Date().toISOString()
-    const next = fn(statesRef.current[lot] ?? blankState())
+
+    // Derive from draftRef (falling back to statesRef), not `prev` inside a
+    // setStates updater: React may not run that updater synchronously, so a
+    // second patchState call in the same tick could still read a stale base.
+    const base = draftRef.current[lot] ?? statesRef.current[lot] ?? blankState()
+    const next = fn(base)
+    draftRef.current[lot] = next
+
+    setStates(prev => ({ ...prev, [lot]: next }))
+
     const payload =
       group === 'inspection' ? next.inspection :
       group === 'commercial' ? next.commercial :
       { decision: next.decision, shortlist: next.shortlist }
-
-    setStates(prev => ({ ...prev, [lot]: next }))
 
     // Fire-and-forget: the UI must never wait on storage or the network.
     // db.ts reports failures via onStorageError, so these catches only swallow.
