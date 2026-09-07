@@ -1314,10 +1314,41 @@ export function can(role: Role | null, action: Action): boolean {
   }
 }
 
+const PROFILE_CACHE_KEY = 'ehs-profile-v1'
+
+/**
+ * The last known profile, cached so the app opens offline. Role here is a UI
+ * convenience only - the server re-checks every request against RLS, so a
+ * tampered cache grants nothing.
+ */
+export function cachedProfile(): Profile | null {
+  try {
+    const raw = localStorage.getItem(PROFILE_CACHE_KEY)
+    if (!raw) return null
+    const p = JSON.parse(raw)
+    return p && typeof p.id === 'string' && typeof p.display_name === 'string'
+      && (p.role === 'admin' || p.role === 'inspector' || p.role === 'viewer')
+      ? p as Profile
+      : null
+  } catch {
+    return null
+  }
+}
+
+export function cacheProfile(p: Profile | null): void {
+  try {
+    if (p) localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(p))
+    else localStorage.removeItem(PROFILE_CACHE_KEY)
+  } catch { /* private mode or quota: the app still works, just re-prompts */ }
+}
+
 export async function fetchProfile(): Promise<Profile | null> {
   const { data: session } = await supabase.auth.getSession()
   const uid = session.session?.user?.id
-  if (!uid) return null
+  if (!uid) {
+    cacheProfile(null)
+    return null
+  }
 
   const { data, error } = await supabase
     .from('profiles')
@@ -1326,7 +1357,9 @@ export async function fetchProfile(): Promise<Profile | null> {
     .maybeSingle()
 
   if (error) throw error
-  return (data as Profile) ?? null
+  const result = (data as Profile) ?? null
+  cacheProfile(result)
+  return result
 }
 
 export async function redeemCode(code: string, displayName: string): Promise<Role> {
@@ -1369,33 +1402,61 @@ git commit -m "feat: add supabase client, anonymous session and profile helpers"
 - [ ] **Step 1: Create `src/components/Gate.tsx`**
 
 ```tsx
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ensureSession } from '../lib/supabase'
-import { fetchProfile, redeemCode, type Profile } from '../lib/profile'
+import { cachedProfile, cacheProfile, fetchProfile, redeemCode, type Profile } from '../lib/profile'
 
 export function Gate({ children }: { children: (profile: Profile) => React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [booting, setBooting] = useState(true)
+  const [offline, setOffline] = useState(false)
   const [code, setCode] = useState('')
   const [name, setName] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const submitting = useRef(false)
+
+  const boot = useCallback(async () => {
+    setOffline(false)
+    const cached = cachedProfile()
+    if (cached) {
+      setProfile(cached)
+      setBooting(false)
+    } else {
+      setBooting(true)
+    }
+
+    try {
+      await ensureSession()
+      const fresh = await fetchProfile()
+      if (fresh) {
+        setProfile(fresh)
+      } else {
+        // Authoritative: server says no profile. Clear any stale cache.
+        cacheProfile(null)
+        setProfile(null)
+      }
+      setError('')
+    } catch (e) {
+      if (!cached) {
+        setOffline(true)
+        setError(e instanceof Error ? e.message : 'Could not reach the server.')
+      }
+      // If we have a cached profile, keep showing the app - the refresh
+      // failed but there's nothing to correct for yet.
+    } finally {
+      setBooting(false)
+    }
+  }, [])
 
   useEffect(() => {
-    ;(async () => {
-      try {
-        await ensureSession()
-        setProfile(await fetchProfile())
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not reach the server.')
-      } finally {
-        setBooting(false)
-      }
-    })()
-  }, [])
+    boot()
+  }, [boot])
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (submitting.current) return
+    submitting.current = true
     setError('')
     setBusy(true)
     try {
@@ -1404,12 +1465,28 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not verify that code.')
     } finally {
+      submitting.current = false
       setBusy(false)
     }
   }
 
   if (booting) return <div className="gate"><p>Starting…</p></div>
   if (profile) return <>{children(profile)}</>
+
+  if (offline) {
+    return (
+      <div className="gate">
+        <div className="gate-card">
+          <div className="brand-mark">EHS</div>
+          <h1>Auction Inspector</h1>
+          <p className="gate-error" role="alert">
+            Can't reach the server. Check your connection and try again.
+          </p>
+          <button className="primary wide" onClick={() => boot()}>Retry</button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="gate">
@@ -1420,7 +1497,8 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
 
         <label>Access code
           <input value={code} onChange={e => setCode(e.target.value)}
-                 autoComplete="off" autoCapitalize="none" required />
+                 autoComplete="off" autoCapitalize="none" autoCorrect="off"
+                 spellCheck={false} required />
         </label>
 
         <label>Your name
@@ -1442,6 +1520,12 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
 ```
 
 There is no role dropdown. The code determines the role server-side — that is the whole point of Task 4.
+
+The gate must not block on the network. It renders from `cachedProfile()` first
+and refreshes in the background, so an inspector who redeemed a code yesterday
+gets straight in with no signal. A genuine connection failure shows a distinct
+retry screen, never the code form — otherwise a dead spot looks like a rejected
+code. The cached role is a UI convenience only; RLS re-checks every request.
 
 - [ ] **Step 2: Wrap the app in `src/main.tsx`**
 
