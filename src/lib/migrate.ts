@@ -11,6 +11,10 @@ function hasWork(s: MachineState): boolean {
   if (Object.values(s.inspection?.scores ?? {}).some(v => v > 0)) return true
   if (Object.values(s.inspection?.critical ?? {}).some(v => v !== 'UNSET')) return true
   if ((s.inspection?.notes ?? '').trim()) return true
+  // An inspector who recorded only who they are and when they looked has still
+  // done work worth keeping - dropping it would lose the provenance of a visit.
+  if ((s.inspection?.inspector ?? '').trim()) return true
+  if ((s.inspection?.inspectedAt ?? '').trim()) return true
   if (s.inspection?.repairEstimateEur) return true
   if (s.commercial?.currentBidEur) return true
   if (s.commercial?.estimatedResaleInr) return true

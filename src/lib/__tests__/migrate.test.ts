@@ -34,4 +34,17 @@ describe('readLegacyState', () => {
     localStorage.setItem(LEGACY_KEY, JSON.stringify({ 1: withNotes, 2: withBid, 3: listed, 4: gated }))
     expect(Object.keys(readLegacyState()!).sort()).toEqual(['1', '2', '3', '4'])
   })
+
+  it('treats an inspector name or visit time alone as real work', () => {
+    const named = blankState(); named.inspection.inspector = 'Rakesh S.'
+    const timed = blankState(); timed.inspection.inspectedAt = '2026-09-09T09:30'
+    localStorage.setItem(LEGACY_KEY, JSON.stringify({ 1: named, 2: timed, 3: blankState() }))
+    expect(Object.keys(readLegacyState()!).sort()).toEqual(['1', '2'])
+  })
+
+  it('skips one malformed lot without discarding the others', () => {
+    const good = blankState(); good.inspection.notes = 'boom weld cracked'
+    localStorage.setItem(LEGACY_KEY, JSON.stringify({ 1: 'not-an-object', 2: good }))
+    expect(Object.keys(readLegacyState()!)).toEqual(['2'])
+  })
 })
