@@ -19,7 +19,13 @@
 - `calc()` and `autoDecision()` must remain behaviourally identical. Any change to their output is a regression.
 - Existing TypeScript types in `src/types.ts` stay as-is, with one exception: `InspectionState.photos` is removed (photos move to their own table).
 - Conflict resolution is **last-write-wins per field group** (`inspection`, `commercial`, `decision`) using client-supplied timestamps.
-- Supabase region: **eu-central-1 (Frankfurt)**. If the existing project is in another region, record the actual region here and proceed — do not recreate the project.
+- **All application objects live in the `ehs` schema, never `public`.** The target
+  project (`zxfyfigmajlvgbddlbbx`, "VanithaHomeKitchen") already hosts an unrelated
+  app in `public`; nothing in this plan may create, alter or drop anything there.
+- The Supabase JS client must be constructed with `db: { schema: 'ehs' }`, and `ehs`
+  must be listed under **Settings → API → Data API → Exposed schemas** or every
+  request 404s.
+- Supabase region: **eu-central-2 (Zurich)**, fixed. Shared with the existing app.
 - Commit after every task. Conventional-commit prefixes (`feat:`, `test:`, `chore:`, `refactor:`).
 
 ## File Structure
@@ -407,8 +413,13 @@ The project ref is the subdomain of your `VITE_SUPABASE_URL` (`https://<ref>.sup
 ```sql
 create extension if not exists pgcrypto;
 
+-- Everything for this app lives here. The project's public schema belongs to an
+-- unrelated application and must not be touched.
+create schema if not exists ehs;
+grant usage on schema ehs to authenticated, anon;
+
 -- Identity. One row per device that has redeemed a code.
-create table public.profiles (
+create table ehs.profiles (
   id            uuid primary key references auth.users(id) on delete cascade,
   display_name  text not null check (length(trim(display_name)) between 1 and 60),
   role          text not null check (role in ('admin','inspector','viewer')),
@@ -416,21 +427,21 @@ create table public.profiles (
 );
 
 -- Hashed access codes, one per role. Never readable by any client.
-create table public.access_codes (
+create table ehs.access_codes (
   role        text primary key check (role in ('admin','inspector','viewer')),
   code_hash   text not null,
   updated_at  timestamptz not null default now()
 );
 
 -- Rate limiting for code redemption, keyed by anonymous auth uid.
-create table public.code_attempts (
+create table ehs.code_attempts (
   uid          uuid primary key,
   attempts     int not null default 0,
   first_at     timestamptz not null default now()
 );
 
 -- Catalog. Mirrors the Machine type in src/types.ts.
-create table public.machines (
+create table ehs.machines (
   lot             int primary key,
   year            int,
   make            text not null,
@@ -453,8 +464,8 @@ create table public.machines (
 );
 
 -- Per-lot state, three independently versioned field groups.
-create table public.machine_states (
-  lot                     int primary key references public.machines(lot) on delete cascade,
+create table ehs.machine_states (
+  lot                     int primary key references ehs.machines(lot) on delete cascade,
   inspection              jsonb not null default '{}'::jsonb,
   inspection_updated_at   timestamptz not null default 'epoch',
   commercial              jsonb not null default '{}'::jsonb,
@@ -464,43 +475,47 @@ create table public.machine_states (
   decision_updated_at     timestamptz not null default 'epoch'
 );
 
-create table public.photos (
+create table ehs.photos (
   id            uuid primary key default gen_random_uuid(),
-  lot           int not null references public.machines(lot) on delete cascade,
+  lot           int not null references ehs.machines(lot) on delete cascade,
   storage_path  text not null unique,
   caption       text,
-  taken_by      uuid references public.profiles(id) on delete set null,
+  taken_by      uuid references ehs.profiles(id) on delete set null,
   created_at    timestamptz not null default now()
 );
-create index photos_lot_idx on public.photos (lot, created_at desc);
+create index photos_lot_idx on ehs.photos (lot, created_at desc);
 
-create table public.comments (
+create table ehs.comments (
   id           uuid primary key default gen_random_uuid(),
-  lot          int not null references public.machines(lot) on delete cascade,
-  author_id    uuid references public.profiles(id) on delete set null,
+  lot          int not null references ehs.machines(lot) on delete cascade,
+  author_id    uuid references ehs.profiles(id) on delete set null,
   author_name  text not null,
   body         text not null check (length(trim(body)) between 1 and 4000),
   created_at   timestamptz not null default now(),
   edited_at    timestamptz
 );
-create index comments_lot_idx on public.comments (lot, created_at);
+create index comments_lot_idx on ehs.comments (lot, created_at);
 
-create table public.comment_reads (
-  profile_id    uuid not null references public.profiles(id) on delete cascade,
-  lot           int not null references public.machines(lot) on delete cascade,
+create table ehs.comment_reads (
+  profile_id    uuid not null references ehs.profiles(id) on delete cascade,
+  lot           int not null references ehs.machines(lot) on delete cascade,
   last_read_at  timestamptz not null default now(),
   primary key (profile_id, lot)
 );
 
+-- PostgREST needs table privileges as well as RLS policies; RLS then narrows
+-- what these grants allow.
+grant select, insert, update, delete on all tables in schema ehs to authenticated;
+
 -- Deny-by-default. Policies arrive in 0003.
-alter table public.profiles       enable row level security;
-alter table public.access_codes   enable row level security;
-alter table public.code_attempts  enable row level security;
-alter table public.machines       enable row level security;
-alter table public.machine_states enable row level security;
-alter table public.photos         enable row level security;
-alter table public.comments       enable row level security;
-alter table public.comment_reads  enable row level security;
+alter table ehs.profiles       enable row level security;
+alter table ehs.access_codes   enable row level security;
+alter table ehs.code_attempts  enable row level security;
+alter table ehs.machines       enable row level security;
+alter table ehs.machine_states enable row level security;
+alter table ehs.photos         enable row level security;
+alter table ehs.comments       enable row level security;
+alter table ehs.comment_reads  enable row level security;
 ```
 
 `inspection_updated_at` defaults to `'epoch'`, not `now()`. A row created by the seed must lose to any real client edit; defaulting to `now()` would make fresh empty rows beat genuine offline work.
@@ -525,7 +540,7 @@ const rows = machines.map(m => `(${[
 ].join(', ')})`).join(',\n  ')
 
 const sql = `-- Generated by scripts/gen-seed.mjs. Do not edit by hand.
-insert into public.machines (
+insert into ehs.machines (
   lot, year, make, model, title, category, power, hours, serial, location,
   image_url, source_url, features, notes, priority, fleet_fit, parts_support,
   rental_demand, source_verified
@@ -533,8 +548,8 @@ insert into public.machines (
   ${rows}
 on conflict (lot) do nothing;
 
-insert into public.machine_states (lot)
-select lot from public.machines
+insert into ehs.machine_states (lot)
+select lot from ehs.machines
 on conflict (lot) do nothing;
 `
 
@@ -564,7 +579,7 @@ npx supabase db execute --file supabase/seed_machines.sql
 - [ ] **Step 7: Verify the tables exist and are seeded**
 
 ```bash
-npx supabase db execute --command "select count(*) as machines from public.machines; select count(*) as states from public.machine_states;"
+npx supabase db execute --command "select count(*) as machines from ehs.machines; select count(*) as states from ehs.machine_states;"
 ```
 
 Expected: both counts equal the number of lots in `src/data.ts`.
@@ -588,10 +603,10 @@ Two functions carry the whole design: one is the only path to a role, the other 
 **Interfaces:**
 - Consumes: tables from Task 3
 - Produces:
-  - `public.caller_role() returns text` — SECURITY DEFINER, reads caller's role
-  - `public.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, raises on failure
-  - `public.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
-  - `public.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
+  - `ehs.caller_role() returns text` — SECURITY DEFINER, reads caller's role
+  - `ehs.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, raises on failure
+  - `ehs.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
+  - `ehs.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
 
 - [ ] **Step 1: Write `supabase/migrations/0002_functions.sql`**
 
@@ -601,25 +616,25 @@ Two functions carry the whole design: one is the only path to a role, the other 
 -- and a built-in Postgres function.
 -- SECURITY DEFINER is required: policies on profiles will themselves call
 -- this function, and a plain query would recurse infinitely.
-create or replace function public.caller_role()
+create or replace function ehs.caller_role()
 returns text
 language sql
 security definer
-set search_path = public
+set search_path = ehs, public
 stable
 as $$
-  select role from public.profiles where id = auth.uid();
+  select role from ehs.profiles where id = auth.uid();
 $$;
 
-revoke all on function public.caller_role() from public;
-grant execute on function public.caller_role() to authenticated;
+revoke all on function ehs.caller_role() from public;
+grant execute on function ehs.caller_role() to authenticated;
 
 -- Redeems a code and creates the caller's profile. The only way to get a role.
-create or replace function public.redeem_access_code(p_code text, p_display_name text)
+create or replace function ehs.redeem_access_code(p_code text, p_display_name text)
 returns text
 language plpgsql
 security definer
-set search_path = public
+set search_path = ehs, public
 as $$
 declare
   v_uid    uuid := auth.uid();
@@ -637,15 +652,15 @@ begin
   end if;
 
   -- Rate limit: 10 attempts per 15 minutes per anonymous identity.
-  insert into public.code_attempts (uid, attempts, first_at)
+  insert into ehs.code_attempts (uid, attempts, first_at)
     values (v_uid, 0, now())
   on conflict (uid) do nothing;
 
   select attempts, first_at into v_tries, v_since
-    from public.code_attempts where uid = v_uid for update;
+    from ehs.code_attempts where uid = v_uid for update;
 
   if v_since < now() - interval '15 minutes' then
-    update public.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
+    update ehs.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
     v_tries := 0;
   end if;
 
@@ -653,39 +668,39 @@ begin
     raise exception 'too many attempts, try again later';
   end if;
 
-  update public.code_attempts set attempts = attempts + 1 where uid = v_uid;
+  update ehs.code_attempts set attempts = attempts + 1 where uid = v_uid;
 
   select role into v_role
-    from public.access_codes
+    from ehs.access_codes
    where code_hash = crypt(p_code, code_hash);
 
   if v_role is null then
     raise exception 'invalid access code';
   end if;
 
-  insert into public.profiles (id, display_name, role)
+  insert into ehs.profiles (id, display_name, role)
     values (v_uid, v_name, v_role)
   on conflict (id) do update
     set display_name = excluded.display_name,
         role         = excluded.role;
 
-  update public.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
+  update ehs.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
   return v_role;
 end;
 $$;
 
-revoke all on function public.redeem_access_code(text, text) from public;
-grant execute on function public.redeem_access_code(text, text) to authenticated;
+revoke all on function ehs.redeem_access_code(text, text) from public;
+grant execute on function ehs.redeem_access_code(text, text) to authenticated;
 
 -- Admin-only code rotation. Stores only the hash.
-create or replace function public.set_access_code(p_role text, p_code text)
+create or replace function ehs.set_access_code(p_role text, p_code text)
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = ehs, public
 as $$
 begin
-  if public.caller_role() is distinct from 'admin' then
+  if ehs.caller_role() is distinct from 'admin' then
     raise exception 'admin role required';
   end if;
   if p_role not in ('admin','inspector','viewer') then
@@ -695,18 +710,18 @@ begin
     raise exception 'code must be at least 6 characters';
   end if;
 
-  insert into public.access_codes (role, code_hash, updated_at)
+  insert into ehs.access_codes (role, code_hash, updated_at)
     values (p_role, crypt(p_code, gen_salt('bf')), now())
   on conflict (role) do update
     set code_hash = excluded.code_hash, updated_at = now();
 end;
 $$;
 
-revoke all on function public.set_access_code(text, text) from public;
-grant execute on function public.set_access_code(text, text) to authenticated;
+revoke all on function ehs.set_access_code(text, text) from public;
+grant execute on function ehs.set_access_code(text, text) to authenticated;
 
 -- The only write path for machine state. Idempotent, per-field-group LWW.
-create or replace function public.sync_machine_state(
+create or replace function ehs.sync_machine_state(
   p_lot int,
   p_group text,
   p_payload jsonb,
@@ -714,7 +729,7 @@ create or replace function public.sync_machine_state(
 ) returns boolean
 language plpgsql
 security invoker          -- runs as the caller, so RLS on machine_states applies
-set search_path = public
+set search_path = ehs, public
 as $$
 declare
   v_applied boolean := false;
@@ -723,21 +738,21 @@ begin
     raise exception 'unknown field group %', p_group;
   end if;
 
-  insert into public.machine_states (lot) values (p_lot)
+  insert into ehs.machine_states (lot) values (p_lot)
   on conflict (lot) do nothing;
 
   if p_group = 'inspection' then
-    update public.machine_states
+    update ehs.machine_states
        set inspection = p_payload, inspection_updated_at = p_client_updated_at
      where lot = p_lot and inspection_updated_at < p_client_updated_at;
 
   elsif p_group = 'commercial' then
-    update public.machine_states
+    update ehs.machine_states
        set commercial = p_payload, commercial_updated_at = p_client_updated_at
      where lot = p_lot and commercial_updated_at < p_client_updated_at;
 
   else
-    update public.machine_states
+    update ehs.machine_states
        set decision   = coalesce(p_payload->>'decision', decision),
            shortlist  = coalesce((p_payload->>'shortlist')::boolean, shortlist),
            decision_updated_at = p_client_updated_at
@@ -749,8 +764,8 @@ begin
 end;
 $$;
 
-revoke all on function public.sync_machine_state(int, text, jsonb, timestamptz) from public;
-grant execute on function public.sync_machine_state(int, text, jsonb, timestamptz) to authenticated;
+revoke all on function ehs.sync_machine_state(int, text, jsonb, timestamptz) from public;
+grant execute on function ehs.sync_machine_state(int, text, jsonb, timestamptz) to authenticated;
 ```
 
 `sync_machine_state` is **SECURITY INVOKER** on purpose. It must run under the caller's own permissions so the RLS policy on `machine_states` rejects a viewer's write. Making it DEFINER would silently hand every viewer full write access — the single most dangerous mistake available in this plan.
@@ -767,7 +782,7 @@ Pick three distinct codes. Replace the placeholders below with your real ones �
 
 ```bash
 npx supabase db execute --command "
-insert into public.access_codes (role, code_hash) values
+insert into ehs.access_codes (role, code_hash) values
   ('admin',     crypt('CHOOSE-ADMIN-CODE',     gen_salt('bf'))),
   ('inspector', crypt('CHOOSE-INSPECTOR-CODE', gen_salt('bf'))),
   ('viewer',    crypt('CHOOSE-VIEWER-CODE',    gen_salt('bf')))
@@ -780,7 +795,7 @@ on conflict (role) do update set code_hash = excluded.code_hash;"
 npx supabase db execute --command "
 select role, code_hash = crypt('CHOOSE-INSPECTOR-CODE', code_hash) as matches,
        left(code_hash, 7) as hash_prefix
-  from public.access_codes order by role;"
+  from ehs.access_codes order by role;"
 ```
 
 Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix` starts `$2a$` or `$2b$` (a bcrypt hash, not the plaintext).
@@ -789,8 +804,8 @@ Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix`
 
 ```bash
 npx supabase db execute --command "
-select public.sync_machine_state(
-  (select min(lot) from public.machines), 'commercial',
+select ehs.sync_machine_state(
+  (select min(lot) from ehs.machines), 'commercial',
   '{\"currentBidEur\": 999}'::jsonb, '1999-01-01T00:00:00Z') as should_be_false;"
 ```
 
@@ -813,7 +828,7 @@ Every table currently has RLS on with zero policies, which means nobody can read
 - Create: `supabase/migrations/0003_rls.sql`
 
 **Interfaces:**
-- Consumes: `public.caller_role()` from Task 4
+- Consumes: `ehs.caller_role()` from Task 4
 - Produces: a private `inspection-photos` storage bucket and policies on all eight tables
 
 - [ ] **Step 1: Write `supabase/migrations/0003_rls.sql`**
@@ -821,89 +836,89 @@ Every table currently has RLS on with zero policies, which means nobody can read
 ```sql
 -- profiles: everyone with a profile can see the team; you edit only your own
 -- name; only an admin changes roles (via the admin update policy below).
-create policy profiles_select on public.profiles
+create policy profiles_select on ehs.profiles
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy profiles_insert_self on public.profiles
+create policy profiles_insert_self on ehs.profiles
   for insert to authenticated
   with check (id = auth.uid());
 
-create policy profiles_update_self on public.profiles
+create policy profiles_update_self on ehs.profiles
   for update to authenticated
   using (id = auth.uid())
-  with check (id = auth.uid() and role = public.caller_role());
+  with check (id = auth.uid() and role = ehs.caller_role());
 
-create policy profiles_admin_all on public.profiles
+create policy profiles_admin_all on ehs.profiles
   for all to authenticated
-  using (public.caller_role() = 'admin')
-  with check (public.caller_role() = 'admin');
+  using (ehs.caller_role() = 'admin')
+  with check (ehs.caller_role() = 'admin');
 
 -- access_codes and code_attempts: no client access at all. The SECURITY
 -- DEFINER functions bypass RLS; nothing else may touch these.
 -- (RLS enabled with no policies = deny all.)
 
 -- machines: everyone reads the catalog, only admins change it.
-create policy machines_select on public.machines
+create policy machines_select on ehs.machines
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy machines_admin_write on public.machines
+create policy machines_admin_write on ehs.machines
   for all to authenticated
-  using (public.caller_role() = 'admin')
-  with check (public.caller_role() = 'admin');
+  using (ehs.caller_role() = 'admin')
+  with check (ehs.caller_role() = 'admin');
 
 -- machine_states: everyone reads, inspectors and admins write.
-create policy states_select on public.machine_states
+create policy states_select on ehs.machine_states
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy states_write on public.machine_states
+create policy states_write on ehs.machine_states
   for all to authenticated
-  using (public.caller_role() in ('inspector','admin'))
-  with check (public.caller_role() in ('inspector','admin'));
+  using (ehs.caller_role() in ('inspector','admin'))
+  with check (ehs.caller_role() in ('inspector','admin'));
 
 -- photos: everyone reads, inspectors add, authors and admins delete.
-create policy photos_select on public.photos
+create policy photos_select on ehs.photos
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy photos_insert on public.photos
+create policy photos_insert on ehs.photos
   for insert to authenticated
-  with check (public.caller_role() in ('inspector','admin') and taken_by = auth.uid());
+  with check (ehs.caller_role() in ('inspector','admin') and taken_by = auth.uid());
 
-create policy photos_delete on public.photos
+create policy photos_delete on ehs.photos
   for delete to authenticated
-  using (taken_by = auth.uid() or public.caller_role() = 'admin');
+  using (taken_by = auth.uid() or ehs.caller_role() = 'admin');
 
 -- comments: anyone with a profile posts; authors edit their own for 5 minutes;
 -- authors and admins delete.
-create policy comments_select on public.comments
+create policy comments_select on ehs.comments
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy comments_insert on public.comments
+create policy comments_insert on ehs.comments
   for insert to authenticated
-  with check (public.caller_role() is not null and author_id = auth.uid());
+  with check (ehs.caller_role() is not null and author_id = auth.uid());
 
-create policy comments_update_own on public.comments
+create policy comments_update_own on ehs.comments
   for update to authenticated
   using (author_id = auth.uid() and created_at > now() - interval '5 minutes')
   with check (author_id = auth.uid());
 
-create policy comments_delete on public.comments
+create policy comments_delete on ehs.comments
   for delete to authenticated
-  using (author_id = auth.uid() or public.caller_role() = 'admin');
+  using (author_id = auth.uid() or ehs.caller_role() = 'admin');
 
 -- comment_reads: strictly your own.
-create policy reads_own on public.comment_reads
+create policy reads_own on ehs.comment_reads
   for all to authenticated
   using (profile_id = auth.uid())
   with check (profile_id = auth.uid());
 
 -- Realtime broadcast for the two tables clients subscribe to.
-alter publication supabase_realtime add table public.machine_states;
-alter publication supabase_realtime add table public.comments;
+alter publication supabase_realtime add table ehs.machine_states;
+alter publication supabase_realtime add table ehs.comments;
 
 -- Private photo bucket.
 insert into storage.buckets (id, name, public)
@@ -912,16 +927,16 @@ on conflict (id) do nothing;
 
 create policy photos_storage_select on storage.objects
   for select to authenticated
-  using (bucket_id = 'inspection-photos' and public.caller_role() is not null);
+  using (bucket_id = 'inspection-photos' and ehs.caller_role() is not null);
 
 create policy photos_storage_insert on storage.objects
   for insert to authenticated
-  with check (bucket_id = 'inspection-photos' and public.caller_role() in ('inspector','admin'));
+  with check (bucket_id = 'inspection-photos' and ehs.caller_role() in ('inspector','admin'));
 
 create policy photos_storage_delete on storage.objects
   for delete to authenticated
   using (bucket_id = 'inspection-photos'
-         and (owner = auth.uid() or public.caller_role() = 'admin'));
+         and (owner = auth.uid() or ehs.caller_role() = 'admin'));
 ```
 
 - [ ] **Step 2: Apply**
@@ -935,7 +950,7 @@ npx supabase db push
 ```bash
 npx supabase db execute --command "
 select tablename, rowsecurity
-  from pg_tables where schemaname = 'public' order by tablename;"
+  from pg_tables where schemaname = 'ehs' order by tablename;"
 ```
 
 Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
@@ -945,11 +960,17 @@ Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
 ```bash
 npx supabase db execute --command "
 select tablename, count(*) as policies
-  from pg_policies where schemaname = 'public'
+  from pg_policies where schemaname = 'ehs'
  group by tablename order by tablename;"
 ```
 
 Expected: `access_codes` and `code_attempts` do not appear at all (zero policies = deny all). Every other table appears with at least one.
+
+- [ ] **Step 5a: Expose the `ehs` schema to the Data API**
+
+In the Supabase dashboard: **Settings → API → Data API → Exposed schemas** — add
+`ehs` alongside `public` and save. Without this every client query returns 404
+with `PGRST106`, even though the tables and policies are correct.
 
 - [ ] **Step 5: Enable anonymous sign-ins**
 
@@ -1049,6 +1070,7 @@ if (!url || !key) {
 }
 
 export const supabase = createClient(url, key, {
+  db: { schema: 'ehs' },   // this project's public schema belongs to another app
   auth: { persistSession: true, autoRefreshToken: true },
 })
 
@@ -1691,7 +1713,7 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
   const channel = supabase
     .channel('machine_states_stream')
     .on('postgres_changes',
-        { event: '*', schema: 'public', table: 'machine_states' },
+        { event: '*', schema: 'ehs', table: 'machine_states' },
         async payload => {
           const row: any = payload.new
           if (!row?.lot) return
@@ -2089,7 +2111,7 @@ Where the old photo input and grid were (removed in Task 2), add:
 `npm run dev`, enter as inspector, add a photo. Expected: it appears instantly with "Waiting to upload", then the caption disappears. Confirm the row landed:
 
 ```bash
-npx supabase db execute --command "select lot, storage_path, created_at from public.photos order by created_at desc limit 5;"
+npx supabase db execute --command "select lot, storage_path, created_at from ehs.photos order by created_at desc limit 5;"
 ```
 
 Then open DevTools → Network → Offline, add another photo, and confirm it appears as pending and uploads when you go back online.
@@ -2147,7 +2169,7 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
   useEffect(() => {
     const channel = supabase.channel(`comments_${lot}`)
       .on('postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'comments', filter: `lot=eq.${lot}` },
+          { event: 'INSERT', schema: 'ehs', table: 'comments', filter: `lot=eq.${lot}` },
           payload => setItems(prev =>
             prev.some(c => c.id === (payload.new as Comment).id)
               ? prev
@@ -2218,7 +2240,7 @@ export function useUnreadCounts(profileId: string): Record<number, number> {
 
     const channel = supabase.channel('comments_unread')
       .on('postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'comments' },
+          { event: 'INSERT', schema: 'ehs', table: 'comments' },
           () => { void compute() })
       .subscribe()
     return () => { void supabase.removeChannel(channel) }
@@ -2482,7 +2504,9 @@ const check = (name, ok) => {
 }
 
 async function asRole(role) {
-  const client = createClient(URL, KEY, { auth: { persistSession: false } })
+  const client = createClient(URL, KEY, {
+    db: { schema: 'ehs' }, auth: { persistSession: false },
+  })
   const { error: authErr } = await client.auth.signInAnonymously()
   if (authErr) throw authErr
   const { data, error } = await client.rpc('redeem_access_code', {
@@ -2498,7 +2522,9 @@ const lot = async client =>
 
 // A device with a session but no redeemed code must see nothing.
 {
-  const anon = createClient(URL, KEY, { auth: { persistSession: false } })
+  const anon = createClient(URL, KEY, {
+    db: { schema: 'ehs' }, auth: { persistSession: false },
+  })
   await anon.auth.signInAnonymously()
   const { data } = await anon.from('machines').select('lot')
   check('no code: cannot read the catalog', (data ?? []).length === 0)
@@ -2583,8 +2609,8 @@ Expected: every line prints `PASS`, exit code 0. Any `FAIL` is a security hole �
 
 ```bash
 npx supabase db execute --command "
-delete from public.comments where author_name like 'rls-check-%';
-delete from public.profiles where display_name like 'rls-check-%';"
+delete from ehs.comments where author_name like 'rls-check-%';
+delete from ehs.profiles where display_name like 'rls-check-%';"
 ```
 
 - [ ] **Step 5: Commit**
@@ -2703,7 +2729,7 @@ Expected: both jobs green. Open the published URL on a phone, enter the inspecto
 
 - [ ] **Step 8: Update the README**
 
-Replace the "For a static GitHub Pages build, entered inspection data stays on the browser/device" line and the "Static MVP persistence" claims with the shared model: access codes per role, live sync, offline-first, comments. Add a short **Operations** section covering: rotating a code with `set_access_code`, the Frankfurt region, and the free-tier 7-day pause risk before an auction.
+Replace the "For a static GitHub Pages build, entered inspection data stays on the browser/device" line and the "Static MVP persistence" claims with the shared model: access codes per role, live sync, offline-first, comments. Add a short **Operations** section covering: rotating a code with `set_access_code`, the eu-central-2 region and shared `ehs` schema, and the free-tier 7-day pause risk before an auction.
 
 - [ ] **Step 9: Commit**
 
