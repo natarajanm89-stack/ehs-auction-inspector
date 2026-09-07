@@ -33,7 +33,6 @@ export interface InspectionState {
   inspector: string
   inspectedAt: string
   repairEstimateEur: number
-  photos: string[]
 }
 
 export interface CommercialState {

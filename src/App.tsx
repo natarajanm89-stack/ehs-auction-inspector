@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
-import { CATEGORY_COUNTS, CRITICAL_CHECKS, EVENT, INSPECTION_SECTIONS, machines } from './data'
+import { CATEGORY_COUNTS, EVENT, INSPECTION_SECTIONS, CRITICAL_CHECKS, machines } from './data'
 import type { Decision, Machine, MachineState } from './types'
+import { autoDecision, blankState, calc } from './lib/calc'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'settings'
 
@@ -9,24 +10,6 @@ const STORAGE_KEY = 'ehs-auction-inspector-state-v1'
 const euro = (n: number) => new Intl.NumberFormat('en-NL', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0)
 const inr = (n: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n || 0)
 
-function blankState(): MachineState {
-  return {
-    shortlist: false,
-    decision: 'UNASSESSED',
-    inspection: {
-      scores: Object.fromEntries(INSPECTION_SECTIONS.map(([name]) => [name, 0])),
-      critical: Object.fromEntries(CRITICAL_CHECKS.map(name => [name, 'UNSET'])),
-      notes: '', inspector: '', inspectedAt: '', repairEstimateEur: 0, photos: [],
-    },
-    commercial: {
-      estimatedResaleInr: 0, monthlyRentalInr: 0, expectedUtilizationPct: 65,
-      transportNlEur: 850, seaFreightEur: 3200, insuranceEur: 250,
-      importPct: 18, inlandIndiaEur: 700, contingencyPct: 7, fxEurInr: 100,
-      targetMarginPct: 20, currentBidEur: 0, manualMaxBidEur: 0, status: 'WATCH',
-    },
-  }
-}
-
 function loadAll(): Record<number, MachineState> {
   try {
     const parsed = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}') as Record<number, MachineState>
@@ -34,38 +17,6 @@ function loadAll(): Record<number, MachineState> {
   } catch {
     return Object.fromEntries(machines.map(m => [m.lot, blankState()]))
   }
-}
-
-function calc(machine: Machine, state: MachineState) {
-  const values = Object.values(state.inspection.scores).filter(v => v > 0)
-  const technical = values.length ? Math.round(values.reduce((a, b) => a + b, 0) / (values.length * 5) * 100) : 0
-  const commercialFit = Math.round(((machine.fleetFit + machine.partsSupport + machine.rentalDemand) / 15) * 100)
-  const criticalFail = Object.values(state.inspection.critical).some(v => v === 'FAIL')
-  const criticalComplete = Object.values(state.inspection.critical).every(v => v === 'PASS')
-  const blended = Math.round(technical * .55 + commercialFit * .45)
-  const c = state.commercial
-  const resaleEur = c.fxEurInr ? c.estimatedResaleInr / c.fxEurInr : 0
-  const desiredCostEur = resaleEur ? resaleEur * (1 - c.targetMarginPct / 100) : 0
-  const fixed = c.transportNlEur + c.seaFreightEur + c.insuranceEur + c.inlandIndiaEur + state.inspection.repairEstimateEur
-  const beforeImport = Math.max(0, desiredCostEur - fixed)
-  const importFactor = 1 + c.importPct / 100
-  const contingencyFactor = 1 + c.contingencyPct / 100
-  const calculatedMaxBid = desiredCostEur ? Math.max(0, beforeImport / importFactor / contingencyFactor) : 0
-  const effectiveMaxBid = c.manualMaxBidEur || calculatedMaxBid
-  const landedEur = (c.currentBidEur + fixed) * importFactor * contingencyFactor
-  const landedInr = landedEur * c.fxEurInr
-  return { technical, commercialFit, blended, criticalFail, criticalComplete, calculatedMaxBid, effectiveMaxBid, landedEur, landedInr }
-}
-
-function autoDecision(machine: Machine, state: MachineState): Decision {
-  const x = calc(machine, state)
-  if (x.criticalFail) return 'REJECT'
-  if (!x.technical) return 'UNASSESSED'
-  if (x.technical < 55 || x.blended < 60) return 'REJECT'
-  if (!x.criticalComplete) return 'HOLD'
-  if (x.blended >= 82) return 'BUY'
-  if (x.blended >= 70) return 'BUY_IF'
-  return 'HOLD'
 }
 
 function Badge({ children, tone = 'neutral' }: { children: React.ReactNode, tone?: string }) {
@@ -206,8 +157,6 @@ function App() {
               <label>Inspection time<input type="datetime-local" value={selectedState.inspection.inspectedAt} onChange={e=>patchState(selected.lot,s=>({...s,inspection:{...s.inspection,inspectedAt:e.target.value}}))}/></label>
               <label>Repair reserve (€)<input type="number" value={selectedState.inspection.repairEstimateEur || ''} onChange={e=>patchState(selected.lot,s=>({...s,inspection:{...s.inspection,repairEstimateEur:Number(e.target.value)}}))}/></label>
               <label className="full">Field notes<textarea rows={5} value={selectedState.inspection.notes} onChange={e=>patchState(selected.lot,s=>({...s,inspection:{...s.inspection,notes:e.target.value}}))} placeholder="Leaks, noise, welds, battery dates, error codes, tyres, documents, parts needed…"/></label>
-              <label className="full">Photo evidence<input type="file" accept="image/*" capture="environment" multiple onChange={e=>handlePhotos(e.target.files, selected.lot, patchState)}/><small>Compressed and stored only in this browser/device for the static GitHub Pages MVP.</small></label>
-              {selectedState.inspection.photos.length > 0 && <div className="photo-grid full">{selectedState.inspection.photos.map((p,i)=><img src={p} key={i} alt={`Inspection ${i+1}`}/>)}</div>}
             </div>
           </div>
 
@@ -277,25 +226,6 @@ function decisionLabel(d: Decision) { return ({UNASSESSED:'UNASSESSED',BUY:'BUY'
 function MachineModal({ machine, state, close, inspect }: { machine: Machine, state: MachineState, close:()=>void, inspect:()=>void }) {
   const c=calc(machine,state||blankState())
   return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" onClick={close}>×</button><img className="modal-image" src={machine.imageUrl} alt={machine.title}/><div className="modal-content"><div className="badges"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><Badge>{machine.category}</Badge><Badge>{machine.power}</Badge></div><h2>Lot {machine.lot} · {machine.make} {machine.model}</h2><p>{machine.title}</p><div className="detail-grid"><span>Year<strong>{machine.year}</strong></span><span>Hours<strong>{machine.hours?.toLocaleString()}</strong></span><span>Serial<strong>{machine.serial || 'Verify on site'}</strong></span><span>EHS fit<strong>{c.commercialFit}%</strong></span></div><h3>Catalog features</h3><ul>{machine.features.map(x=><li key={x}>{x}</li>)}</ul>{machine.notes && <div className="catalog-note"><strong>Catalog note</strong><p>{machine.notes}</p></div>}<p className="muted">Catalog fields are source-verified starter data, not an EHS condition guarantee. Verify serial, hours, CE, functions and defects during inspection.</p><div className="hero-actions"><button className="primary" onClick={inspect}>Start inspection</button><a className="button-link" href={machine.sourceUrl} target="_blank">Open source ↗</a></div></div></div></div>
-}
-
-async function handlePhotos(files: FileList | null, lot: number, patchState: (lot:number,fn:(s:MachineState)=>MachineState)=>void) {
-  if (!files) return
-  const images: string[] = []
-  for (const file of Array.from(files).slice(0, 6)) {
-    images.push(await compressImage(file))
-  }
-  patchState(lot,s=>({...s,inspection:{...s.inspection,photos:[...s.inspection.photos,...images].slice(-6)}}))
-}
-
-function compressImage(file: File): Promise<string> {
-  return new Promise((resolve,reject)=>{
-    const reader=new FileReader(); reader.onerror=reject; reader.onload=()=>{
-      const img=new Image(); img.onerror=reject; img.onload=()=>{
-        const max=800; const scale=Math.min(1,max/Math.max(img.width,img.height)); const canvas=document.createElement('canvas'); canvas.width=Math.round(img.width*scale); canvas.height=Math.round(img.height*scale); const ctx=canvas.getContext('2d')!; ctx.drawImage(img,0,0,canvas.width,canvas.height); resolve(canvas.toDataURL('image/jpeg',.55))
-      }; img.src=String(reader.result)
-    }; reader.readAsDataURL(file)
-  })
 }
 
 export default App
