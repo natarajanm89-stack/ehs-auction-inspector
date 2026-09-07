@@ -27,9 +27,13 @@ function downscale(file: File): Promise<Blob> {
   })
 }
 
+const SIGNED_URL_TTL = 3600
+const SIGNED_URL_REFRESH_MS = 45 * 60 * 1000
+
 export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: boolean; profileId: string }) {
   const [shots, setShots] = useState<Shot[]>([])
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
   // Tracks object URLs from the previous render so they can be revoked once
   // replaced - otherwise a long inspection session leaks memory on a phone.
   const objectUrls = useRef<string[]>([])
@@ -38,11 +42,20 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
     const { data } = await supabase.from('photos')
       .select('id, storage_path').eq('lot', lot).order('created_at', { ascending: false })
 
+    const rows = data ?? []
     const uploaded: Shot[] = []
-    for (const row of data ?? []) {
-      const { data: signed } = await supabase.storage
-        .from('inspection-photos').createSignedUrl(row.storage_path, 3600)
-      if (signed?.signedUrl) uploaded.push({ id: row.id, url: signed.signedUrl, pending: false })
+    if (rows.length > 0) {
+      const paths = rows.map(row => row.storage_path)
+      const { data: signedList } = await supabase.storage
+        .from('inspection-photos').createSignedUrls(paths, SIGNED_URL_TTL)
+      const urlByPath = new Map<string, string>()
+      for (const signed of signedList ?? []) {
+        if (signed.signedUrl && signed.path) urlByPath.set(signed.path, signed.signedUrl)
+      }
+      for (const row of rows) {
+        const url = urlByPath.get(row.storage_path)
+        if (url) uploaded.push({ id: row.id, url, pending: false })
+      }
     }
 
     const pending: Shot[] = []
@@ -70,12 +83,33 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
   // Revoke any outstanding object URLs on unmount.
   useEffect(() => () => { objectUrls.current.forEach(u => URL.revokeObjectURL(u)) }, [])
 
+  // Signed URLs expire after SIGNED_URL_TTL seconds. Refresh well inside
+  // that window on a timer, and again whenever the tab regains visibility -
+  // a viewer can leave the tab open for hours.
+  useEffect(() => {
+    const interval = setInterval(() => { void load() }, SIGNED_URL_REFRESH_MS)
+    const onVisible = () => { if (document.visibilityState === 'visible') void load() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [load])
+
   const upload = async (id: string, blob: Blob) => {
-    const { error } = await supabase.storage
-      .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg' })
-    if (error) return                       // stays pending, retried on next load
-    await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
+    const { error: uploadError } = await supabase.storage
+      .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg', upsert: true })
+    if (uploadError) return false           // stays pending, retried on next load
+
+    const { error: insertError } = await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
+    // A unique-violation on storage_path means a previous attempt already
+    // created the row (e.g. storage succeeded but the insert failed or the
+    // connection dropped before the response arrived). That is success, not
+    // failure - the evidence is already recorded.
+    if (insertError && insertError.code !== '23505') return false
+
     await deletePhotoBlob(id)
+    return true
   }
 
   const onPick = async (files: FileList | null) => {
@@ -83,11 +117,20 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
     setBusy(true)
     try {
       for (const file of Array.from(files).slice(0, 6)) {
-        const blob = await downscale(file)
+        let blob: Blob
+        try {
+          blob = await downscale(file)
+        } catch {
+          setError('Could not read that image. Try taking the photo again.')
+          continue                          // skip this file, keep processing the rest
+        }
         const id = `${lot}/${crypto.randomUUID()}.jpg`
         await putPhotoBlob(id, blob)        // survives a crash or signal loss
         await load()                        // show it immediately
-        if (navigator.onLine) await upload(id, blob)
+        if (navigator.onLine) {
+          const ok = await upload(id, blob)
+          if (ok) setError('')
+        }
       }
       await load()
     } finally {
@@ -100,16 +143,28 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
   // on every render.
   useEffect(() => {
     const retry = async () => {
+      let allOk = true
       for (const id of await listPendingPhotos()) {
         if (!id.startsWith(`${lot}/`)) continue
         const blob = await getPhotoBlob(id)
-        if (blob) await upload(id, blob)
+        if (blob) {
+          const ok = await upload(id, blob)
+          if (!ok) allOk = false
+        }
       }
+      if (allOk) setError('')
       await load()
     }
     window.addEventListener('online', retry)
     return () => window.removeEventListener('online', retry)
   }, [lot, load])
+
+  // An offline inspector is expected to have pending photos - only surface a
+  // failure note once the device is online and photos are still stuck.
+  const pendingCount = shots.filter(s => s.pending).length
+  const pendingNote = pendingCount > 0 && navigator.onLine
+    ? `${pendingCount} photo${pendingCount > 1 ? 's' : ''} could not upload. ${pendingCount > 1 ? 'They are' : 'It is'} saved on this device and will retry.`
+    : ''
 
   return (
     <div className="photos">
@@ -120,6 +175,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
           <small>Stored on this device immediately, uploaded when there is signal.</small>
         </label>
       )}
+      {(error || pendingNote) && <p className="photo-error" role="alert">{error || pendingNote}</p>}
       {shots.length > 0 && (
         <div className="photo-grid full">
           {shots.map(s => (
