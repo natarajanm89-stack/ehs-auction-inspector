@@ -28,7 +28,7 @@
 - Supabase region: **eu-central-2 (Zurich)**, fixed. Shared with the existing app.
 - **Never run `supabase db push`, `db reset` or `db pull`.** The remote project holds
   21 migrations owned by another application. All SQL here is applied with
-  `psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f <file>`, and our SQL lives in `db/`,
+  `psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f <file>`, and our SQL lives in `db/`,
   outside `supabase/migrations/`, so the CLI never touches it.
 - Commit after every task. Conventional-commit prefixes (`feat:`, `test:`, `chore:`, `refactor:`).
 
@@ -412,8 +412,7 @@ with that history. All SQL in this plan is applied directly with `psql`, which
 leaves the other app's migration history untouched.
 
 ```bash
-set -a && source .env && set +a
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select current_database(), current_user;"
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "select current_database(), current_user;"
 ```
 
 Expected: one row. If `psql` is not on PATH, use
@@ -583,9 +582,8 @@ Verify the count matches the source: `grep -c '^  (' db/seed_machines.sql` shoul
 - [ ] **Step 6: Apply the schema and seed**
 
 ```bash
-set -a && source .env && set +a
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0001_schema.sql
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/seed_machines.sql
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/0001_schema.sql
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/seed_machines.sql
 ```
 
 `ON_ERROR_STOP=1` matters: without it psql reports success after a failed
@@ -594,7 +592,7 @@ statement, and you would seed into a half-built schema.
 - [ ] **Step 7: Verify the tables exist and are seeded**
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select count(*) as machines from ehs.machines; select count(*) as states from ehs.machine_states;"
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "select count(*) as machines from ehs.machines; select count(*) as states from ehs.machine_states;"
 ```
 
 Expected: both counts equal the number of lots in `src/data.ts`.
@@ -788,8 +786,7 @@ grant execute on function ehs.sync_machine_state(int, text, jsonb, timestamptz) 
 - [ ] **Step 2: Apply the migration**
 
 ```bash
-set -a && source .env && set +a
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0002_functions.sql
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/0002_functions.sql
 ```
 
 - [ ] **Step 3: Seed the three access codes**
@@ -797,7 +794,7 @@ psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0002_functions.sql
 Pick three distinct codes. Replace the placeholders below with your real ones — and do not commit them anywhere.
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 insert into ehs.access_codes (role, code_hash) values
   ('admin',     crypt('CHOOSE-ADMIN-CODE',     gen_salt('bf'))),
   ('inspector', crypt('CHOOSE-INSPECTOR-CODE', gen_salt('bf'))),
@@ -808,7 +805,7 @@ on conflict (role) do update set code_hash = excluded.code_hash;"
 - [ ] **Step 4: Verify the codes match and the plaintext is unrecoverable**
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select role, code_hash = crypt('CHOOSE-INSPECTOR-CODE', code_hash) as matches,
        left(code_hash, 7) as hash_prefix
   from ehs.access_codes order by role;"
@@ -819,7 +816,7 @@ Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix`
 - [ ] **Step 5: Verify stale writes are rejected**
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select ehs.sync_machine_state(
   (select min(lot) from ehs.machines), 'commercial',
   '{\"currentBidEur\": 999}'::jsonb, '1999-01-01T00:00:00Z') as should_be_false;"
@@ -958,14 +955,13 @@ create policy photos_storage_delete on storage.objects
 - [ ] **Step 2: Apply**
 
 ```bash
-set -a && source .env && set +a
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0003_rls.sql
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/0003_rls.sql
 ```
 
 - [ ] **Step 3: Verify every table has RLS enabled**
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select tablename, rowsecurity
   from pg_tables where schemaname = 'ehs' order by tablename;"
 ```
@@ -975,7 +971,7 @@ Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
 - [ ] **Step 4: Verify the two locked tables have no policies**
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select tablename, count(*) as policies
   from pg_policies where schemaname = 'ehs'
  group by tablename order by tablename;"
@@ -2128,7 +2124,7 @@ Where the old photo input and grid were (removed in Task 2), add:
 `npm run dev`, enter as inspector, add a photo. Expected: it appears instantly with "Waiting to upload", then the caption disappears. Confirm the row landed:
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select lot, storage_path, created_at from ehs.photos order by created_at desc limit 5;"
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "select lot, storage_path, created_at from ehs.photos order by created_at desc limit 5;"
 ```
 
 Then open DevTools → Network → Offline, add another photo, and confirm it appears as pending and uploads when you go back online.
@@ -2625,7 +2621,7 @@ Expected: every line prints `PASS`, exit code 0. Any `FAIL` is a security hole �
 - [ ] **Step 4: Clean up the check's test rows**
 
 ```bash
-psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 delete from ehs.comments where author_name like 'rls-check-%';
 delete from ehs.profiles where display_name like 'rls-check-%';"
 ```
