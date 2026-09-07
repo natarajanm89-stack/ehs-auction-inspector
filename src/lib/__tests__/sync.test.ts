@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 
 const { rpc, fromMock, channelHandlers } = vi.hoisted(() => ({
   rpc: vi.fn(),
@@ -195,6 +195,67 @@ describe('startSync realtime handler', () => {
 
     expect(putState).not.toHaveBeenCalled()
     expect(onRemoteState).not.toHaveBeenCalled()
+    cleanup()
+  })
+})
+
+describe('backfill on reconnect / visibility', () => {
+  const row = (lot: number) => ({ lot, inspection: {}, commercial: {}, decision: 'UNASSESSED', shortlist: false })
+
+  beforeEach(() => {
+    vi.mocked(isDirty).mockReset()
+    vi.mocked(putState).mockClear()
+    vi.useFakeTimers()
+  })
+
+  afterEach(() => { vi.useRealTimers() })
+
+  it('re-pulls and applies clean lots on an online event', async () => {
+    vi.mocked(isDirty).mockResolvedValue(false)
+    fromMock.mockReturnValue({ select: () => Promise.resolve({ data: [row(500)], error: null }) })
+    const onRemoteState = vi.fn()
+    const cleanup = startSync(onRemoteState)
+    onRemoteState.mockClear()
+
+    window.dispatchEvent(new Event('online'))
+    await vi.advanceTimersByTimeAsync(600)
+
+    expect(putState).toHaveBeenCalledWith(500, expect.any(Object))
+    expect(onRemoteState).toHaveBeenCalledWith(500, expect.any(Object))
+    cleanup()
+  })
+
+  it('never overwrites a lot with unsynced local edits (isDirty guard)', async () => {
+    vi.mocked(isDirty).mockResolvedValue(true)
+    fromMock.mockReturnValue({ select: () => Promise.resolve({ data: [row(501)], error: null }) })
+    const onRemoteState = vi.fn()
+    const cleanup = startSync(onRemoteState)
+    onRemoteState.mockClear()
+
+    document.dispatchEvent(new Event('visibilitychange'))
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+    window.dispatchEvent(new Event('online'))
+    await vi.advanceTimersByTimeAsync(600)
+
+    expect(putState).not.toHaveBeenCalled()
+    expect(onRemoteState).not.toHaveBeenCalled()
+    cleanup()
+  })
+
+  it('debounces rapid visibility flaps into a single pull', async () => {
+    vi.mocked(isDirty).mockResolvedValue(false)
+    let calls = 0
+    fromMock.mockImplementation(() => { calls++; return { select: () => Promise.resolve({ data: [], error: null }) } })
+    Object.defineProperty(document, 'visibilityState', { value: 'visible', configurable: true })
+    const cleanup = startSync(vi.fn())
+    calls = 0
+
+    document.dispatchEvent(new Event('visibilitychange'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    document.dispatchEvent(new Event('visibilitychange'))
+    await vi.advanceTimersByTimeAsync(600)
+
+    expect(calls).toBe(1)
     cleanup()
   })
 })

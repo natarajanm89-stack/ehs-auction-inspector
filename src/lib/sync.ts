@@ -165,11 +165,39 @@ export async function pullAll(): Promise<Record<number, MachineState>> {
  */
 export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
   currentOnRemoteState = onRemoteState
-  const online  = () => { void refreshPending().then(() => drainOutbox()) }
+  const online  = () => { void refreshPending().then(() => drainOutbox()); scheduleBackfill() }
   const offline = () => emit({ status: 'offline' })
+  const onVisible = () => { if (document.visibilityState === 'visible') scheduleBackfill() }
+
+  // A dropped realtime connection (phone lock, cell handover, laptop sleep)
+  // leaves no backfill: on reconnect / becoming visible, re-pull everything
+  // and hand each row through the same isDirty-guarded path as realtime, so
+  // a viewer's screen doesn't sit stale while looking live. Debounced so a
+  // rapid visibility flap (locking/unlocking quickly) doesn't fire several
+  // pulls at once.
+  let backfillTimer: number | undefined
+  function scheduleBackfill() {
+    window.clearTimeout(backfillTimer)
+    backfillTimer = window.setTimeout(() => { void backfill() }, 500)
+  }
+  async function backfill() {
+    if (!navigator.onLine) return
+    try {
+      const remote = await pullAll()
+      const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+      for (const [lotKey, state] of Object.entries(remote)) {
+        const lot = Number(lotKey)
+        const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
+        if (dirty.some(Boolean)) continue
+        await putState(lot, state)
+        currentOnRemoteState?.(lot, state)
+      }
+    } catch { /* offline or transient error: try again on the next trigger */ }
+  }
 
   window.addEventListener('online', online)
   window.addEventListener('offline', offline)
+  document.addEventListener('visibilitychange', onVisible)
 
   const timer = window.setInterval(() => { if (navigator.onLine) void drainOutbox() }, 15_000)
 
@@ -202,6 +230,8 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
   return () => {
     window.removeEventListener('online', online)
     window.removeEventListener('offline', offline)
+    document.removeEventListener('visibilitychange', onVisible)
+    window.clearTimeout(backfillTimer)
     window.clearInterval(timer)
     void supabase.removeChannel(channel)
     currentOnRemoteState = null
