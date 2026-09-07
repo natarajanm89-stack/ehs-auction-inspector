@@ -3182,9 +3182,11 @@ jobs:
 
 `npm test` runs before the build on purpose: a failing calc regression should block the deploy, not ship.
 
-- [ ] **Step 3: Check the existing service worker**
+- [ ] **Step 3: Verify the service worker before deploy**
 
-Open `public/sw.js`. If it caches the app shell with a hardcoded version string, bump it — a stale cached shell will keep serving the pre-Supabase bundle after deploy. Confirm it does **not** cache `*.supabase.co` requests; caching an API response would show inspectors stale inspection data with no indication it is old.
+`public/sw.js` was fixed for the cache-first staleness defect: it is now network-first for navigations and same-origin scripts/styles (falling back to cache only when the network fails), uses a versioned cache name (`ehs-auction-inspector-v2`) that the `activate` handler purges old copies of, and is only registered in production (`src/main.tsx` guards registration with `import.meta.env.PROD`, and unregisters any worker a dev session may have installed).
+
+Before this deploy: if the app shell changed (anything in `SHELL` in `public/sw.js`, or the precache list), bump the `CACHE` version string so the new shell is installed cleanly. Confirm the fetch handler still returns early for any request that is not same-origin, so `*.supabase.co` requests are never intercepted, cached, or served from cache — caching an API response would show inspectors stale inspection data with no indication it is old.
 
 - [ ] **Step 4: Create the repo and push**
 
