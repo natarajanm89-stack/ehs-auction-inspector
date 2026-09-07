@@ -1,0 +1,2726 @@
+# Shared Persistence, Access Codes and Team Comments — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Move the EHS Auction Inspector from single-device `localStorage` to shared Supabase persistence with access-code entry, three roles, offline-first sync, photo upload and per-lot comment threads.
+
+**Architecture:** The app stays a static Vite build on GitHub Pages and talks directly to Supabase. IndexedDB is the working copy the UI reads and writes; a background sync worker pushes dirty field-groups through one idempotent RPC and pulls changes via realtime. All permissions are enforced by Postgres row-level security, never by the client.
+
+**Tech Stack:** React 18 + TypeScript + Vite; `@supabase/supabase-js` v2; `idb-keyval` for IndexedDB; Vitest + `fake-indexeddb` for tests; Supabase CLI for SQL migrations; GitHub Actions → GitHub Pages.
+
+**Spec:** `docs/superpowers/specs/2026-09-07-shared-persistence-design.md`
+
+## Global Constraints
+
+- Frontend stays a **static build**. No server-side runtime of ours. All Supabase access is from the browser.
+- **The UI never awaits the network.** Every mutation writes IndexedDB + React state + outbox synchronously, then returns.
+- **RLS is the only security boundary.** Never gate behaviour on client-side role checks alone; every table has explicit policies and no table is left with RLS disabled.
+- The anon key is public by design. The `service_role` key must never appear in `src/`, `.env`, or any committed file.
+- `calc()` and `autoDecision()` must remain behaviourally identical. Any change to their output is a regression.
+- Existing TypeScript types in `src/types.ts` stay as-is, with one exception: `InspectionState.photos` is removed (photos move to their own table).
+- Conflict resolution is **last-write-wins per field group** (`inspection`, `commercial`, `decision`) using client-supplied timestamps.
+- Supabase region: **eu-central-1 (Frankfurt)**. If the existing project is in another region, record the actual region here and proceed — do not recreate the project.
+- Commit after every task. Conventional-commit prefixes (`feat:`, `test:`, `chore:`, `refactor:`).
+
+## File Structure
+
+| File | Responsibility |
+|---|---|
+| `supabase/migrations/0001_schema.sql` | Tables, indexes, enum-ish constraints |
+| `supabase/migrations/0002_functions.sql` | `redeem_access_code`, `sync_machine_state`, role helper |
+| `supabase/migrations/0003_rls.sql` | RLS policies for every table + storage bucket |
+| `supabase/seed_machines.sql` | Generated one-time catalog seed from `src/data.ts` |
+| `src/lib/supabase.ts` | Client construction + anonymous session bootstrap |
+| `src/lib/profile.ts` | Profile fetch, role type, `redeemCode()` wrapper |
+| `src/lib/db.ts` | IndexedDB: state cache, photo blobs, outbox queue |
+| `src/lib/sync.ts` | Outbox drain, realtime subscribe, online/offline state |
+| `src/lib/calc.ts` | `blankState`, `calc`, `autoDecision` lifted from `App.tsx` |
+| `src/lib/migrate.ts` | One-time `localStorage` → server import |
+| `src/hooks/useMachineState.ts` | Local-first read/write hook per lot |
+| `src/components/Gate.tsx` | Access code + name screen |
+| `src/components/SyncBadge.tsx` | synced / pending N / offline indicator |
+| `src/components/Comments.tsx` | Thread, composer, unread marker |
+| `src/components/Photos.tsx` | Capture, local preview, upload state |
+| `src/App.tsx` | Routing + shell only |
+| `scripts/check-rls.mjs` | Scripted RLS assertion across all three roles |
+| `.github/workflows/deploy.yml` | Build + publish to Pages |
+
+---
+
+### Task 1: Repo, dependencies and test harness
+
+This directory is not yet a git repo and has no test runner. Everything downstream needs both.
+
+**Files:**
+- Create: `.gitignore` (already written), `vitest.config.ts`, `src/lib/__tests__/harness.test.ts`
+- Modify: `package.json`
+
+**Interfaces:**
+- Consumes: nothing
+- Produces: `npm test` runs Vitest; `npm run build` still succeeds
+
+- [ ] **Step 1: Initialise git and commit the current state**
+
+```bash
+cd /Users/natarajanmurugesan/Downloads/ehs-auction-inspector
+git init -b main
+git add -A
+git commit -m "chore: baseline before shared persistence work"
+```
+
+Expected: a first commit containing `src/`, `docs/`, `.gitignore`, and **not** `.env` or `node_modules`. Verify with `git status --short` (should be clean) and `git ls-files | grep -c node_modules` (should print `0`).
+
+- [ ] **Step 2: Install dependencies**
+
+```bash
+npm install @supabase/supabase-js idb-keyval
+npm install -D vitest fake-indexeddb @vitest/coverage-v8 jsdom @testing-library/react @testing-library/jest-dom
+```
+
+- [ ] **Step 3: Add the test script**
+
+In `package.json`, add to `scripts`:
+
+```json
+"test": "vitest run",
+"test:watch": "vitest"
+```
+
+- [ ] **Step 4: Create `vitest.config.ts`**
+
+```ts
+import { defineConfig } from 'vitest/config'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    environment: 'jsdom',
+    setupFiles: ['./vitest.setup.ts'],
+    globals: true,
+  },
+})
+```
+
+- [ ] **Step 5: Create `vitest.setup.ts`**
+
+`fake-indexeddb/auto` installs a working IndexedDB into jsdom, which has none. Without it every `db.ts` test fails with `indexedDB is not defined`.
+
+```ts
+import 'fake-indexeddb/auto'
+import '@testing-library/jest-dom/vitest'
+```
+
+- [ ] **Step 6: Write a harness test that proves the setup works**
+
+Create `src/lib/__tests__/harness.test.ts`:
+
+```ts
+import { describe, it, expect } from 'vitest'
+
+describe('test harness', () => {
+  it('provides IndexedDB in the test environment', () => {
+    expect(typeof indexedDB).toBe('object')
+    expect(indexedDB).not.toBeNull()
+  })
+})
+```
+
+- [ ] **Step 7: Run the tests**
+
+Run: `npm test`
+Expected: PASS, 1 test.
+
+- [ ] **Step 8: Verify the production build is unbroken**
+
+Run: `npm run build`
+Expected: exit 0, `dist/` produced.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add -A
+git commit -m "chore: add vitest harness and supabase dependencies"
+```
+
+---
+
+### Task 2: Extract calc.ts with regression tests
+
+`calc()`, `autoDecision()` and `blankState()` live inside `src/App.tsx` (lines 12–68). Every later task needs them, and `App.tsx` is about to be split. Lift them first, under test, so a later regression is caught immediately.
+
+**Files:**
+- Create: `src/lib/calc.ts`, `src/lib/__tests__/calc.test.ts`
+- Modify: `src/App.tsx:12-68` (delete the moved functions, import them instead)
+
+**Interfaces:**
+- Consumes: `Machine`, `MachineState` from `src/types.ts`; `INSPECTION_SECTIONS`, `CRITICAL_CHECKS` from `src/data.ts`
+- Produces:
+  - `blankState(): MachineState`
+  - `calc(machine: Machine, state: MachineState): CalcResult`
+  - `autoDecision(machine: Machine, state: MachineState): Decision`
+  - `interface CalcResult { technical: number; commercialFit: number; blended: number; criticalFail: boolean; criticalComplete: boolean; calculatedMaxBid: number; effectiveMaxBid: number; landedEur: number; landedInr: number }`
+
+- [ ] **Step 1: Write the failing regression tests**
+
+Create `src/lib/__tests__/calc.test.ts`. These pin the current behaviour exactly — if the lift changes any number, they fail.
+
+```ts
+import { describe, it, expect } from 'vitest'
+import { blankState, calc, autoDecision } from '../calc'
+import { machines } from '../../data'
+
+const m = machines[0]
+
+function scored(value: number) {
+  const s = blankState()
+  Object.keys(s.inspection.scores).forEach(k => { s.inspection.scores[k] = value })
+  return s
+}
+
+function allPass(state = scored(5)) {
+  Object.keys(state.inspection.critical).forEach(k => { state.inspection.critical[k] = 'PASS' })
+  return state
+}
+
+describe('calc', () => {
+  it('reports zero technical score when nothing is scored', () => {
+    expect(calc(m, blankState()).technical).toBe(0)
+  })
+
+  it('reports 100 technical when every section scores 5', () => {
+    expect(calc(m, scored(5)).technical).toBe(100)
+  })
+
+  it('reports 60 technical when every section scores 3', () => {
+    expect(calc(m, scored(3)).technical).toBe(60)
+  })
+
+  it('ignores unscored sections in the average', () => {
+    const s = blankState()
+    const keys = Object.keys(s.inspection.scores)
+    s.inspection.scores[keys[0]] = 4
+    expect(calc(m, s).technical).toBe(80)
+  })
+
+  it('blends technical and commercial fit 55/45', () => {
+    const s = scored(5)
+    const r = calc(m, s)
+    expect(r.blended).toBe(Math.round(r.technical * 0.55 + r.commercialFit * 0.45))
+  })
+
+  it('flags criticalFail when any gate is FAIL', () => {
+    const s = allPass()
+    s.inspection.critical[Object.keys(s.inspection.critical)[0]] = 'FAIL'
+    expect(calc(m, s).criticalFail).toBe(true)
+    expect(calc(m, s).criticalComplete).toBe(false)
+  })
+
+  it('returns zero max bid when no resale value is entered', () => {
+    expect(calc(m, blankState()).calculatedMaxBid).toBe(0)
+  })
+
+  it('prefers a manual stop-bid over the calculated one', () => {
+    const s = scored(5)
+    s.commercial.estimatedResaleInr = 4_500_000
+    s.commercial.manualMaxBidEur = 12_345
+    expect(calc(m, s).effectiveMaxBid).toBe(12_345)
+  })
+
+  it('derives max bid from resale, margin, fixed costs, import and contingency', () => {
+    const s = blankState()
+    s.commercial.estimatedResaleInr = 4_500_000
+    const c = s.commercial
+    const resaleEur = c.estimatedResaleInr / c.fxEurInr
+    const desired = resaleEur * (1 - c.targetMarginPct / 100)
+    const fixed = c.transportNlEur + c.seaFreightEur + c.insuranceEur + c.inlandIndiaEur
+    const expected = Math.max(0, desired - fixed) / (1 + c.importPct / 100) / (1 + c.contingencyPct / 100)
+    expect(calc(m, s).calculatedMaxBid).toBeCloseTo(expected, 6)
+  })
+
+  it('includes the repair reserve in landed cost', () => {
+    const a = blankState(); a.commercial.currentBidEur = 10_000
+    const b = blankState(); b.commercial.currentBidEur = 10_000; b.inspection.repairEstimateEur = 1_000
+    expect(calc(m, b).landedEur).toBeGreaterThan(calc(m, a).landedEur)
+  })
+})
+
+describe('autoDecision', () => {
+  it('is UNASSESSED before any scoring', () => {
+    expect(autoDecision(m, blankState())).toBe('UNASSESSED')
+  })
+
+  it('is REJECT when a critical gate fails, even with perfect scores', () => {
+    const s = allPass()
+    s.inspection.critical[Object.keys(s.inspection.critical)[0]] = 'FAIL'
+    expect(autoDecision(m, s)).toBe('REJECT')
+  })
+
+  it('is REJECT when technical is below 55', () => {
+    expect(autoDecision(m, allPass(scored(2)))).toBe('REJECT')
+  })
+
+  it('is HOLD when scores are good but gates are incomplete', () => {
+    expect(autoDecision(m, scored(5))).toBe('HOLD')
+  })
+
+  it('is BUY when gates all pass and blended is at least 82', () => {
+    const s = allPass(scored(5))
+    expect(calc(m, s).blended).toBeGreaterThanOrEqual(82)
+    expect(autoDecision(m, s)).toBe('BUY')
+  })
+})
+```
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `npm test -- calc`
+Expected: FAIL — `Failed to resolve import "../calc"`.
+
+- [ ] **Step 3: Create `src/lib/calc.ts`**
+
+Move the three functions from `App.tsx` **verbatim** — do not "improve" them. `photos` is dropped from `blankState` because it moves to its own table in Task 3.
+
+```ts
+import { CRITICAL_CHECKS, INSPECTION_SECTIONS } from '../data'
+import type { Decision, Machine, MachineState } from '../types'
+
+export interface CalcResult {
+  technical: number
+  commercialFit: number
+  blended: number
+  criticalFail: boolean
+  criticalComplete: boolean
+  calculatedMaxBid: number
+  effectiveMaxBid: number
+  landedEur: number
+  landedInr: number
+}
+
+export function blankState(): MachineState {
+  return {
+    shortlist: false,
+    decision: 'UNASSESSED',
+    inspection: {
+      scores: Object.fromEntries(INSPECTION_SECTIONS.map(([name]) => [name, 0])),
+      critical: Object.fromEntries(CRITICAL_CHECKS.map(name => [name, 'UNSET'])),
+      notes: '', inspector: '', inspectedAt: '', repairEstimateEur: 0,
+    },
+    commercial: {
+      estimatedResaleInr: 0, monthlyRentalInr: 0, expectedUtilizationPct: 65,
+      transportNlEur: 850, seaFreightEur: 3200, insuranceEur: 250,
+      importPct: 18, inlandIndiaEur: 700, contingencyPct: 7, fxEurInr: 100,
+      targetMarginPct: 20, currentBidEur: 0, manualMaxBidEur: 0, status: 'WATCH',
+    },
+  }
+}
+
+export function calc(machine: Machine, state: MachineState): CalcResult {
+  const values = Object.values(state.inspection.scores).filter(v => v > 0)
+  const technical = values.length ? Math.round(values.reduce((a, b) => a + b, 0) / (values.length * 5) * 100) : 0
+  const commercialFit = Math.round(((machine.fleetFit + machine.partsSupport + machine.rentalDemand) / 15) * 100)
+  const criticalFail = Object.values(state.inspection.critical).some(v => v === 'FAIL')
+  const criticalComplete = Object.values(state.inspection.critical).every(v => v === 'PASS')
+  const blended = Math.round(technical * .55 + commercialFit * .45)
+  const c = state.commercial
+  const resaleEur = c.fxEurInr ? c.estimatedResaleInr / c.fxEurInr : 0
+  const desiredCostEur = resaleEur ? resaleEur * (1 - c.targetMarginPct / 100) : 0
+  const fixed = c.transportNlEur + c.seaFreightEur + c.insuranceEur + c.inlandIndiaEur + state.inspection.repairEstimateEur
+  const beforeImport = Math.max(0, desiredCostEur - fixed)
+  const importFactor = 1 + c.importPct / 100
+  const contingencyFactor = 1 + c.contingencyPct / 100
+  const calculatedMaxBid = desiredCostEur ? Math.max(0, beforeImport / importFactor / contingencyFactor) : 0
+  const effectiveMaxBid = c.manualMaxBidEur || calculatedMaxBid
+  const landedEur = (c.currentBidEur + fixed) * importFactor * contingencyFactor
+  const landedInr = landedEur * c.fxEurInr
+  return { technical, commercialFit, blended, criticalFail, criticalComplete, calculatedMaxBid, effectiveMaxBid, landedEur, landedInr }
+}
+
+export function autoDecision(machine: Machine, state: MachineState): Decision {
+  const x = calc(machine, state)
+  if (x.criticalFail) return 'REJECT'
+  if (!x.technical) return 'UNASSESSED'
+  if (x.technical < 55 || x.blended < 60) return 'REJECT'
+  if (!x.criticalComplete) return 'HOLD'
+  if (x.blended >= 82) return 'BUY'
+  if (x.blended >= 70) return 'BUY_IF'
+  return 'HOLD'
+}
+```
+
+- [ ] **Step 4: Remove `photos` from the inspection type**
+
+In `src/types.ts`, delete the line `photos: string[]` from `InspectionState`.
+
+- [ ] **Step 5: Update `App.tsx` to import instead of define**
+
+Delete `blankState`, `calc` and `autoDecision` from `src/App.tsx` and add to the imports at the top:
+
+```ts
+import { autoDecision, blankState, calc } from './lib/calc'
+```
+
+Also delete the now-dead `photos` references in `App.tsx`: the `<div className="photo-grid full">` block and the `handlePhotos` / `compressImage` functions plus the `<input type="file" …>` label that calls `handlePhotos`. Task 11 replaces them with `<Photos />`.
+
+- [ ] **Step 6: Run tests and typecheck**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.app.json && npm run build`
+Expected: all tests PASS, no type errors, build succeeds.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "refactor: extract calc.ts with regression tests"
+```
+
+---
+
+### Task 3: Database schema
+
+**Files:**
+- Create: `supabase/migrations/0001_schema.sql`, `scripts/gen-seed.mjs`, `supabase/seed_machines.sql`
+
+**Interfaces:**
+- Consumes: `src/data.ts` (`machines` array) as the seed source
+- Produces: tables `profiles`, `access_codes`, `machines`, `machine_states`, `photos`, `comments`, `comment_reads`
+
+- [ ] **Step 1: Initialise the Supabase CLI project**
+
+```bash
+npx supabase init
+```
+
+Expected: creates `supabase/config.toml`. Answer "n" to generating VS Code settings.
+
+- [ ] **Step 2: Link to your existing project**
+
+```bash
+npx supabase login
+npx supabase link --project-ref <YOUR-PROJECT-REF>
+```
+
+The project ref is the subdomain of your `VITE_SUPABASE_URL` (`https://<ref>.supabase.co`).
+
+- [ ] **Step 3: Write `supabase/migrations/0001_schema.sql`**
+
+```sql
+create extension if not exists pgcrypto;
+
+-- Identity. One row per device that has redeemed a code.
+create table public.profiles (
+  id            uuid primary key references auth.users(id) on delete cascade,
+  display_name  text not null check (length(trim(display_name)) between 1 and 60),
+  role          text not null check (role in ('admin','inspector','viewer')),
+  created_at    timestamptz not null default now()
+);
+
+-- Hashed access codes, one per role. Never readable by any client.
+create table public.access_codes (
+  role        text primary key check (role in ('admin','inspector','viewer')),
+  code_hash   text not null,
+  updated_at  timestamptz not null default now()
+);
+
+-- Rate limiting for code redemption, keyed by anonymous auth uid.
+create table public.code_attempts (
+  uid          uuid primary key,
+  attempts     int not null default 0,
+  first_at     timestamptz not null default now()
+);
+
+-- Catalog. Mirrors the Machine type in src/types.ts.
+create table public.machines (
+  lot             int primary key,
+  year            int,
+  make            text not null,
+  model           text not null,
+  title           text not null,
+  category        text not null,
+  power           text not null,
+  hours           int,
+  serial          text,
+  location        text not null,
+  image_url       text,
+  source_url      text not null,
+  features        text[] not null default '{}',
+  notes           text,
+  priority        text not null check (priority in ('P1','P2','P3')),
+  fleet_fit       int not null,
+  parts_support   int not null,
+  rental_demand   int not null,
+  source_verified boolean not null default false
+);
+
+-- Per-lot state, three independently versioned field groups.
+create table public.machine_states (
+  lot                     int primary key references public.machines(lot) on delete cascade,
+  inspection              jsonb not null default '{}'::jsonb,
+  inspection_updated_at   timestamptz not null default 'epoch',
+  commercial              jsonb not null default '{}'::jsonb,
+  commercial_updated_at   timestamptz not null default 'epoch',
+  decision                text not null default 'UNASSESSED',
+  shortlist               boolean not null default false,
+  decision_updated_at     timestamptz not null default 'epoch'
+);
+
+create table public.photos (
+  id            uuid primary key default gen_random_uuid(),
+  lot           int not null references public.machines(lot) on delete cascade,
+  storage_path  text not null unique,
+  caption       text,
+  taken_by      uuid references public.profiles(id) on delete set null,
+  created_at    timestamptz not null default now()
+);
+create index photos_lot_idx on public.photos (lot, created_at desc);
+
+create table public.comments (
+  id           uuid primary key default gen_random_uuid(),
+  lot          int not null references public.machines(lot) on delete cascade,
+  author_id    uuid references public.profiles(id) on delete set null,
+  author_name  text not null,
+  body         text not null check (length(trim(body)) between 1 and 4000),
+  created_at   timestamptz not null default now(),
+  edited_at    timestamptz
+);
+create index comments_lot_idx on public.comments (lot, created_at);
+
+create table public.comment_reads (
+  profile_id    uuid not null references public.profiles(id) on delete cascade,
+  lot           int not null references public.machines(lot) on delete cascade,
+  last_read_at  timestamptz not null default now(),
+  primary key (profile_id, lot)
+);
+
+-- Deny-by-default. Policies arrive in 0003.
+alter table public.profiles       enable row level security;
+alter table public.access_codes   enable row level security;
+alter table public.code_attempts  enable row level security;
+alter table public.machines       enable row level security;
+alter table public.machine_states enable row level security;
+alter table public.photos         enable row level security;
+alter table public.comments       enable row level security;
+alter table public.comment_reads  enable row level security;
+```
+
+`inspection_updated_at` defaults to `'epoch'`, not `now()`. A row created by the seed must lose to any real client edit; defaulting to `now()` would make fresh empty rows beat genuine offline work.
+
+- [ ] **Step 4: Write the seed generator `scripts/gen-seed.mjs`**
+
+Hand-writing 20+ INSERT statements invites transcription errors. Generate them from the existing typed data instead.
+
+```js
+import { machines } from '../src/data.ts'
+import { writeFileSync } from 'node:fs'
+
+const q = v => v === undefined || v === null ? 'null' : `'${String(v).replace(/'/g, "''")}'`
+const n = v => v === undefined || v === null ? 'null' : Number(v)
+const arr = a => `array[${(a || []).map(q).join(',')}]::text[]`
+
+const rows = machines.map(m => `(${[
+  n(m.lot), n(m.year), q(m.make), q(m.model), q(m.title), q(m.category), q(m.power),
+  n(m.hours), q(m.serial), q(m.location), q(m.imageUrl), q(m.sourceUrl), arr(m.features),
+  q(m.notes), q(m.priority), n(m.fleetFit), n(m.partsSupport), n(m.rentalDemand),
+  m.sourceVerified ? 'true' : 'false',
+].join(', ')})`).join(',\n  ')
+
+const sql = `-- Generated by scripts/gen-seed.mjs. Do not edit by hand.
+insert into public.machines (
+  lot, year, make, model, title, category, power, hours, serial, location,
+  image_url, source_url, features, notes, priority, fleet_fit, parts_support,
+  rental_demand, source_verified
+) values
+  ${rows}
+on conflict (lot) do nothing;
+
+insert into public.machine_states (lot)
+select lot from public.machines
+on conflict (lot) do nothing;
+`
+
+writeFileSync(new URL('../supabase/seed_machines.sql', import.meta.url), sql)
+console.log(`wrote ${machines.length} machines`)
+```
+
+- [ ] **Step 5: Generate the seed**
+
+```bash
+npx vite-node scripts/gen-seed.mjs
+```
+
+(`vite-node` is already available via Vite; it resolves the `.ts` import that plain `node` cannot.)
+
+Expected: prints `wrote N machines`; `supabase/seed_machines.sql` exists.
+
+Verify the count matches the source: `grep -c '^  (' supabase/seed_machines.sql` should equal the number of entries in `src/data.ts`.
+
+- [ ] **Step 6: Apply the schema and seed**
+
+```bash
+npx supabase db push
+npx supabase db execute --file supabase/seed_machines.sql
+```
+
+- [ ] **Step 7: Verify the tables exist and are seeded**
+
+```bash
+npx supabase db execute --command "select count(*) as machines from public.machines; select count(*) as states from public.machine_states;"
+```
+
+Expected: both counts equal the number of lots in `src/data.ts`.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add supabase schema and catalog seed"
+```
+
+---
+
+### Task 4: Database functions
+
+Two functions carry the whole design: one is the only path to a role, the other is the only path to writing state.
+
+**Files:**
+- Create: `supabase/migrations/0002_functions.sql`
+
+**Interfaces:**
+- Consumes: tables from Task 3
+- Produces:
+  - `public.caller_role() returns text` — SECURITY DEFINER, reads caller's role
+  - `public.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, raises on failure
+  - `public.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
+  - `public.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
+
+- [ ] **Step 1: Write `supabase/migrations/0002_functions.sql`**
+
+```sql
+-- Reads the caller's role without triggering the profiles RLS policy.
+-- Named caller_role, not current_role: current_role is a reserved SQL keyword
+-- and a built-in Postgres function.
+-- SECURITY DEFINER is required: policies on profiles will themselves call
+-- this function, and a plain query would recurse infinitely.
+create or replace function public.caller_role()
+returns text
+language sql
+security definer
+set search_path = public
+stable
+as $$
+  select role from public.profiles where id = auth.uid();
+$$;
+
+revoke all on function public.caller_role() from public;
+grant execute on function public.caller_role() to authenticated;
+
+-- Redeems a code and creates the caller's profile. The only way to get a role.
+create or replace function public.redeem_access_code(p_code text, p_display_name text)
+returns text
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_uid    uuid := auth.uid();
+  v_role   text;
+  v_name   text := trim(p_display_name);
+  v_tries  int;
+  v_since  timestamptz;
+begin
+  if v_uid is null then
+    raise exception 'not authenticated';
+  end if;
+
+  if length(v_name) < 1 or length(v_name) > 60 then
+    raise exception 'name must be between 1 and 60 characters';
+  end if;
+
+  -- Rate limit: 10 attempts per 15 minutes per anonymous identity.
+  insert into public.code_attempts (uid, attempts, first_at)
+    values (v_uid, 0, now())
+  on conflict (uid) do nothing;
+
+  select attempts, first_at into v_tries, v_since
+    from public.code_attempts where uid = v_uid for update;
+
+  if v_since < now() - interval '15 minutes' then
+    update public.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
+    v_tries := 0;
+  end if;
+
+  if v_tries >= 10 then
+    raise exception 'too many attempts, try again later';
+  end if;
+
+  update public.code_attempts set attempts = attempts + 1 where uid = v_uid;
+
+  select role into v_role
+    from public.access_codes
+   where code_hash = crypt(p_code, code_hash);
+
+  if v_role is null then
+    raise exception 'invalid access code';
+  end if;
+
+  insert into public.profiles (id, display_name, role)
+    values (v_uid, v_name, v_role)
+  on conflict (id) do update
+    set display_name = excluded.display_name,
+        role         = excluded.role;
+
+  update public.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
+  return v_role;
+end;
+$$;
+
+revoke all on function public.redeem_access_code(text, text) from public;
+grant execute on function public.redeem_access_code(text, text) to authenticated;
+
+-- Admin-only code rotation. Stores only the hash.
+create or replace function public.set_access_code(p_role text, p_code text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  if public.caller_role() is distinct from 'admin' then
+    raise exception 'admin role required';
+  end if;
+  if p_role not in ('admin','inspector','viewer') then
+    raise exception 'unknown role %', p_role;
+  end if;
+  if length(p_code) < 6 then
+    raise exception 'code must be at least 6 characters';
+  end if;
+
+  insert into public.access_codes (role, code_hash, updated_at)
+    values (p_role, crypt(p_code, gen_salt('bf')), now())
+  on conflict (role) do update
+    set code_hash = excluded.code_hash, updated_at = now();
+end;
+$$;
+
+revoke all on function public.set_access_code(text, text) from public;
+grant execute on function public.set_access_code(text, text) to authenticated;
+
+-- The only write path for machine state. Idempotent, per-field-group LWW.
+create or replace function public.sync_machine_state(
+  p_lot int,
+  p_group text,
+  p_payload jsonb,
+  p_client_updated_at timestamptz
+) returns boolean
+language plpgsql
+security invoker          -- runs as the caller, so RLS on machine_states applies
+set search_path = public
+as $$
+declare
+  v_applied boolean := false;
+begin
+  if p_group not in ('inspection','commercial','decision') then
+    raise exception 'unknown field group %', p_group;
+  end if;
+
+  insert into public.machine_states (lot) values (p_lot)
+  on conflict (lot) do nothing;
+
+  if p_group = 'inspection' then
+    update public.machine_states
+       set inspection = p_payload, inspection_updated_at = p_client_updated_at
+     where lot = p_lot and inspection_updated_at < p_client_updated_at;
+
+  elsif p_group = 'commercial' then
+    update public.machine_states
+       set commercial = p_payload, commercial_updated_at = p_client_updated_at
+     where lot = p_lot and commercial_updated_at < p_client_updated_at;
+
+  else
+    update public.machine_states
+       set decision   = coalesce(p_payload->>'decision', decision),
+           shortlist  = coalesce((p_payload->>'shortlist')::boolean, shortlist),
+           decision_updated_at = p_client_updated_at
+     where lot = p_lot and decision_updated_at < p_client_updated_at;
+  end if;
+
+  get diagnostics v_applied = row_count;
+  return v_applied;
+end;
+$$;
+
+revoke all on function public.sync_machine_state(int, text, jsonb, timestamptz) from public;
+grant execute on function public.sync_machine_state(int, text, jsonb, timestamptz) to authenticated;
+```
+
+`sync_machine_state` is **SECURITY INVOKER** on purpose. It must run under the caller's own permissions so the RLS policy on `machine_states` rejects a viewer's write. Making it DEFINER would silently hand every viewer full write access — the single most dangerous mistake available in this plan.
+
+- [ ] **Step 2: Apply the migration**
+
+```bash
+npx supabase db push
+```
+
+- [ ] **Step 3: Seed the three access codes**
+
+Pick three distinct codes. Replace the placeholders below with your real ones — and do not commit them anywhere.
+
+```bash
+npx supabase db execute --command "
+insert into public.access_codes (role, code_hash) values
+  ('admin',     crypt('CHOOSE-ADMIN-CODE',     gen_salt('bf'))),
+  ('inspector', crypt('CHOOSE-INSPECTOR-CODE', gen_salt('bf'))),
+  ('viewer',    crypt('CHOOSE-VIEWER-CODE',    gen_salt('bf')))
+on conflict (role) do update set code_hash = excluded.code_hash;"
+```
+
+- [ ] **Step 4: Verify the codes match and the plaintext is unrecoverable**
+
+```bash
+npx supabase db execute --command "
+select role, code_hash = crypt('CHOOSE-INSPECTOR-CODE', code_hash) as matches,
+       left(code_hash, 7) as hash_prefix
+  from public.access_codes order by role;"
+```
+
+Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix` starts `$2a$` or `$2b$` (a bcrypt hash, not the plaintext).
+
+- [ ] **Step 5: Verify stale writes are rejected**
+
+```bash
+npx supabase db execute --command "
+select public.sync_machine_state(
+  (select min(lot) from public.machines), 'commercial',
+  '{\"currentBidEur\": 999}'::jsonb, '1999-01-01T00:00:00Z') as should_be_false;"
+```
+
+Expected: `f`. An epoch-old timestamp must not beat the row's `'epoch'` default via `<` — confirming the comparison is strict.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add access code redemption and state sync functions"
+```
+
+---
+
+### Task 5: Row-level security policies and storage
+
+Every table currently has RLS on with zero policies, which means nobody can read anything. This task defines who can do what.
+
+**Files:**
+- Create: `supabase/migrations/0003_rls.sql`
+
+**Interfaces:**
+- Consumes: `public.caller_role()` from Task 4
+- Produces: a private `inspection-photos` storage bucket and policies on all eight tables
+
+- [ ] **Step 1: Write `supabase/migrations/0003_rls.sql`**
+
+```sql
+-- profiles: everyone with a profile can see the team; you edit only your own
+-- name; only an admin changes roles (via the admin update policy below).
+create policy profiles_select on public.profiles
+  for select to authenticated
+  using (public.caller_role() is not null);
+
+create policy profiles_insert_self on public.profiles
+  for insert to authenticated
+  with check (id = auth.uid());
+
+create policy profiles_update_self on public.profiles
+  for update to authenticated
+  using (id = auth.uid())
+  with check (id = auth.uid() and role = public.caller_role());
+
+create policy profiles_admin_all on public.profiles
+  for all to authenticated
+  using (public.caller_role() = 'admin')
+  with check (public.caller_role() = 'admin');
+
+-- access_codes and code_attempts: no client access at all. The SECURITY
+-- DEFINER functions bypass RLS; nothing else may touch these.
+-- (RLS enabled with no policies = deny all.)
+
+-- machines: everyone reads the catalog, only admins change it.
+create policy machines_select on public.machines
+  for select to authenticated
+  using (public.caller_role() is not null);
+
+create policy machines_admin_write on public.machines
+  for all to authenticated
+  using (public.caller_role() = 'admin')
+  with check (public.caller_role() = 'admin');
+
+-- machine_states: everyone reads, inspectors and admins write.
+create policy states_select on public.machine_states
+  for select to authenticated
+  using (public.caller_role() is not null);
+
+create policy states_write on public.machine_states
+  for all to authenticated
+  using (public.caller_role() in ('inspector','admin'))
+  with check (public.caller_role() in ('inspector','admin'));
+
+-- photos: everyone reads, inspectors add, authors and admins delete.
+create policy photos_select on public.photos
+  for select to authenticated
+  using (public.caller_role() is not null);
+
+create policy photos_insert on public.photos
+  for insert to authenticated
+  with check (public.caller_role() in ('inspector','admin') and taken_by = auth.uid());
+
+create policy photos_delete on public.photos
+  for delete to authenticated
+  using (taken_by = auth.uid() or public.caller_role() = 'admin');
+
+-- comments: anyone with a profile posts; authors edit their own for 5 minutes;
+-- authors and admins delete.
+create policy comments_select on public.comments
+  for select to authenticated
+  using (public.caller_role() is not null);
+
+create policy comments_insert on public.comments
+  for insert to authenticated
+  with check (public.caller_role() is not null and author_id = auth.uid());
+
+create policy comments_update_own on public.comments
+  for update to authenticated
+  using (author_id = auth.uid() and created_at > now() - interval '5 minutes')
+  with check (author_id = auth.uid());
+
+create policy comments_delete on public.comments
+  for delete to authenticated
+  using (author_id = auth.uid() or public.caller_role() = 'admin');
+
+-- comment_reads: strictly your own.
+create policy reads_own on public.comment_reads
+  for all to authenticated
+  using (profile_id = auth.uid())
+  with check (profile_id = auth.uid());
+
+-- Realtime broadcast for the two tables clients subscribe to.
+alter publication supabase_realtime add table public.machine_states;
+alter publication supabase_realtime add table public.comments;
+
+-- Private photo bucket.
+insert into storage.buckets (id, name, public)
+  values ('inspection-photos', 'inspection-photos', false)
+on conflict (id) do nothing;
+
+create policy photos_storage_select on storage.objects
+  for select to authenticated
+  using (bucket_id = 'inspection-photos' and public.caller_role() is not null);
+
+create policy photos_storage_insert on storage.objects
+  for insert to authenticated
+  with check (bucket_id = 'inspection-photos' and public.caller_role() in ('inspector','admin'));
+
+create policy photos_storage_delete on storage.objects
+  for delete to authenticated
+  using (bucket_id = 'inspection-photos'
+         and (owner = auth.uid() or public.caller_role() = 'admin'));
+```
+
+- [ ] **Step 2: Apply**
+
+```bash
+npx supabase db push
+```
+
+- [ ] **Step 3: Verify every table has RLS enabled**
+
+```bash
+npx supabase db execute --command "
+select tablename, rowsecurity
+  from pg_tables where schemaname = 'public' order by tablename;"
+```
+
+Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
+
+- [ ] **Step 4: Verify the two locked tables have no policies**
+
+```bash
+npx supabase db execute --command "
+select tablename, count(*) as policies
+  from pg_policies where schemaname = 'public'
+ group by tablename order by tablename;"
+```
+
+Expected: `access_codes` and `code_attempts` do not appear at all (zero policies = deny all). Every other table appears with at least one.
+
+- [ ] **Step 5: Enable anonymous sign-ins**
+
+In the Supabase dashboard: **Authentication → Sign In / Providers → Anonymous sign-ins → Enable**. Without this, `signInAnonymously()` in Task 6 fails with `anonymous_provider_disabled` and nothing else in the app works.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add row-level security policies and photo storage bucket"
+```
+
+---
+
+### Task 6: Supabase client and anonymous session
+
+**Files:**
+- Create: `src/lib/supabase.ts`, `src/lib/profile.ts`, `src/lib/__tests__/profile.test.ts`
+- Create: `src/vite-env.d.ts`
+
+**Interfaces:**
+- Consumes: `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`
+- Produces:
+  - `supabase: SupabaseClient`
+  - `ensureSession(): Promise<string>` — returns the anonymous user id, signing in if needed
+  - `type Role = 'admin' | 'inspector' | 'viewer'`
+  - `interface Profile { id: string; display_name: string; role: Role }`
+  - `fetchProfile(): Promise<Profile | null>`
+  - `redeemCode(code: string, displayName: string): Promise<Role>`
+  - `can(role: Role | null, action: 'write_state' | 'write_catalog' | 'comment'): boolean`
+
+- [ ] **Step 1: Declare the env var types**
+
+Create `src/vite-env.d.ts`:
+
+```ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_SUPABASE_URL: string
+  readonly VITE_SUPABASE_ANON_KEY: string
+}
+interface ImportMeta { readonly env: ImportMetaEnv }
+```
+
+- [ ] **Step 2: Write the failing test for `can()`**
+
+`can()` is pure, so it is the piece worth unit-testing. It is a **UI convenience only** — it decides whether to show a disabled control. The real enforcement is RLS, verified in Task 14.
+
+Create `src/lib/__tests__/profile.test.ts`:
+
+```ts
+import { describe, it, expect } from 'vitest'
+import { can } from '../profile'
+
+describe('can', () => {
+  it('lets inspectors and admins write state', () => {
+    expect(can('inspector', 'write_state')).toBe(true)
+    expect(can('admin', 'write_state')).toBe(true)
+  })
+  it('does not let viewers write state', () => {
+    expect(can('viewer', 'write_state')).toBe(false)
+  })
+  it('lets only admins write the catalog', () => {
+    expect(can('admin', 'write_catalog')).toBe(true)
+    expect(can('inspector', 'write_catalog')).toBe(false)
+  })
+  it('lets every role comment', () => {
+    expect(can('viewer', 'comment')).toBe(true)
+    expect(can('inspector', 'comment')).toBe(true)
+    expect(can('admin', 'comment')).toBe(true)
+  })
+  it('denies everything without a role', () => {
+    expect(can(null, 'write_state')).toBe(false)
+    expect(can(null, 'comment')).toBe(false)
+  })
+})
+```
+
+- [ ] **Step 3: Run it to verify it fails**
+
+Run: `npm test -- profile`
+Expected: FAIL — `Failed to resolve import "../profile"`.
+
+- [ ] **Step 4: Create `src/lib/supabase.ts`**
+
+```ts
+import { createClient } from '@supabase/supabase-js'
+
+const url = import.meta.env.VITE_SUPABASE_URL
+const key = import.meta.env.VITE_SUPABASE_ANON_KEY
+
+if (!url || !key) {
+  throw new Error(
+    'Missing VITE_SUPABASE_URL or VITE_SUPABASE_ANON_KEY. Copy .env.example to .env and fill it in.'
+  )
+}
+
+export const supabase = createClient(url, key, {
+  auth: { persistSession: true, autoRefreshToken: true },
+})
+
+/** Returns the anonymous user id, creating a session on first run. */
+export async function ensureSession(): Promise<string> {
+  const { data: existing } = await supabase.auth.getSession()
+  if (existing.session?.user) return existing.session.user.id
+
+  const { data, error } = await supabase.auth.signInAnonymously()
+  if (error) throw error
+  return data.user!.id
+}
+```
+
+- [ ] **Step 5: Create `src/lib/profile.ts`**
+
+```ts
+import { supabase } from './supabase'
+
+export type Role = 'admin' | 'inspector' | 'viewer'
+
+export interface Profile {
+  id: string
+  display_name: string
+  role: Role
+}
+
+export type Action = 'write_state' | 'write_catalog' | 'comment'
+
+/**
+ * UI convenience only. The authoritative check is the RLS policy in
+ * supabase/migrations/0003_rls.sql — never rely on this for security.
+ */
+export function can(role: Role | null, action: Action): boolean {
+  if (!role) return false
+  switch (action) {
+    case 'write_state':   return role === 'inspector' || role === 'admin'
+    case 'write_catalog': return role === 'admin'
+    case 'comment':       return true
+  }
+}
+
+export async function fetchProfile(): Promise<Profile | null> {
+  const { data: session } = await supabase.auth.getSession()
+  const uid = session.session?.user?.id
+  if (!uid) return null
+
+  const { data, error } = await supabase
+    .from('profiles')
+    .select('id, display_name, role')
+    .eq('id', uid)
+    .maybeSingle()
+
+  if (error) throw error
+  return (data as Profile) ?? null
+}
+
+export async function redeemCode(code: string, displayName: string): Promise<Role> {
+  const { data, error } = await supabase.rpc('redeem_access_code', {
+    p_code: code.trim(),
+    p_display_name: displayName.trim(),
+  })
+  if (error) throw new Error(error.message)
+  return data as Role
+}
+```
+
+- [ ] **Step 6: Run tests**
+
+Run: `npm test -- profile`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add supabase client, anonymous session and profile helpers"
+```
+
+---
+
+### Task 7: Gate screen
+
+**Files:**
+- Create: `src/components/Gate.tsx`
+- Modify: `src/main.tsx`
+
+**Interfaces:**
+- Consumes: `ensureSession`, `fetchProfile`, `redeemCode`, `Profile` from Task 6
+- Produces: `<Gate>{(profile) => ReactNode}</Gate>` — renders children only once a profile exists
+
+- [ ] **Step 1: Create `src/components/Gate.tsx`**
+
+```tsx
+import { useEffect, useState } from 'react'
+import { ensureSession } from '../lib/supabase'
+import { fetchProfile, redeemCode, type Profile } from '../lib/profile'
+
+export function Gate({ children }: { children: (profile: Profile) => React.ReactNode }) {
+  const [profile, setProfile] = useState<Profile | null>(null)
+  const [booting, setBooting] = useState(true)
+  const [code, setCode] = useState('')
+  const [name, setName] = useState('')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    ;(async () => {
+      try {
+        await ensureSession()
+        setProfile(await fetchProfile())
+      } catch (e) {
+        setError(e instanceof Error ? e.message : 'Could not reach the server.')
+      } finally {
+        setBooting(false)
+      }
+    })()
+  }, [])
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    setBusy(true)
+    try {
+      await redeemCode(code, name)
+      setProfile(await fetchProfile())
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not verify that code.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (booting) return <div className="gate"><p>Starting…</p></div>
+  if (profile) return <>{children(profile)}</>
+
+  return (
+    <div className="gate">
+      <form className="gate-card" onSubmit={submit}>
+        <div className="brand-mark">EHS</div>
+        <h1>Auction Inspector</h1>
+        <p className="muted">Enter the access code your team lead gave you.</p>
+
+        <label>Access code
+          <input value={code} onChange={e => setCode(e.target.value)}
+                 autoComplete="off" autoCapitalize="none" required />
+        </label>
+
+        <label>Your name
+          <input value={name} onChange={e => setName(e.target.value)}
+                 placeholder="e.g. Rakesh S." maxLength={60} required />
+        </label>
+
+        {error && <p className="gate-error" role="alert">{error}</p>}
+
+        <button className="primary wide" disabled={busy || !code.trim() || !name.trim()}>
+          {busy ? 'Checking…' : 'Enter'}
+        </button>
+        <small className="muted">Your code decides what you can do. Inspectors record
+          findings; viewers read and comment.</small>
+      </form>
+    </div>
+  )
+}
+```
+
+There is no role dropdown. The code determines the role server-side — that is the whole point of Task 4.
+
+- [ ] **Step 2: Wrap the app in `src/main.tsx`**
+
+```tsx
+import React from 'react'
+import ReactDOM from 'react-dom/client'
+import App from './App'
+import { Gate } from './components/Gate'
+import './styles.css'
+
+ReactDOM.createRoot(document.getElementById('root')!).render(
+  <React.StrictMode>
+    <Gate>{profile => <App profile={profile} />}</Gate>
+  </React.StrictMode>
+)
+```
+
+Keep any existing service-worker registration in `main.tsx` exactly as it is.
+
+- [ ] **Step 3: Accept the prop in `App.tsx`**
+
+```tsx
+import type { Profile } from './lib/profile'
+
+function App({ profile }: { profile: Profile }) {
+```
+
+- [ ] **Step 4: Add gate styles to `src/styles.css`**
+
+```css
+.gate { min-height: 100dvh; display: grid; place-items: center; padding: 24px; }
+.gate-card { width: min(380px, 100%); display: grid; gap: 14px; padding: 28px;
+  border-radius: 16px; background: #fff; box-shadow: 0 10px 40px rgba(0,0,0,.12); }
+.gate-card h1 { margin: 0; font-size: 22px; }
+.gate-card label { display: grid; gap: 6px; font-size: 13px; font-weight: 600; }
+.gate-card input { padding: 11px 12px; border: 1px solid #d6dae2; border-radius: 9px;
+  font-size: 16px; }
+.gate-error { margin: 0; color: #b42318; font-size: 13px; }
+```
+
+`font-size: 16px` on the inputs is deliberate: iOS Safari zooms the viewport on focus for anything smaller, which is disorienting on a phone in the field.
+
+- [ ] **Step 5: Verify manually**
+
+Fill `.env` with your real values, then `npm run dev`. Expected: the gate appears; a wrong code shows "invalid access code"; the inspector code lets you through to the app.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add access code gate screen"
+```
+
+---
+
+### Task 8: IndexedDB store and outbox
+
+The heart of local-first. Fully testable without a network.
+
+**Files:**
+- Create: `src/lib/db.ts`, `src/lib/__tests__/db.test.ts`
+
+**Interfaces:**
+- Consumes: `MachineState` from `src/types.ts`
+- Produces:
+  - `type FieldGroup = 'inspection' | 'commercial' | 'decision'`
+  - `interface OutboxEntry { lot: number; group: FieldGroup; payload: unknown; updatedAt: string }`
+  - `getState(lot): Promise<MachineState | null>` / `putState(lot, state): Promise<void>`
+  - `getAllStates(): Promise<Record<number, MachineState>>`
+  - `enqueue(entry: OutboxEntry): Promise<void>` — collapses to one entry per `(lot, group)`
+  - `listOutbox(): Promise<OutboxEntry[]>` / `dequeue(lot, group, updatedAt): Promise<void>`
+  - `isDirty(lot, group): Promise<boolean>`
+  - `putPhotoBlob(id, blob)` / `getPhotoBlob(id)` / `deletePhotoBlob(id)` / `listPendingPhotos()`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `src/lib/__tests__/db.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { blankState } from '../calc'
+import {
+  clearAll, getState, putState, getAllStates,
+  enqueue, listOutbox, dequeue, isDirty,
+} from '../db'
+
+beforeEach(async () => { await clearAll() })
+
+describe('state cache', () => {
+  it('returns null for an unknown lot', async () => {
+    expect(await getState(999)).toBeNull()
+  })
+
+  it('round-trips a state', async () => {
+    const s = blankState()
+    s.inspection.notes = 'hydraulic weep at boom pivot'
+    await putState(412, s)
+    expect((await getState(412))?.inspection.notes).toBe('hydraulic weep at boom pivot')
+  })
+
+  it('returns every cached state keyed by lot', async () => {
+    await putState(1, blankState())
+    await putState(2, blankState())
+    expect(Object.keys(await getAllStates()).sort()).toEqual(['1', '2'])
+  })
+})
+
+describe('outbox', () => {
+  const entry = (lot: number, group: any, updatedAt: string, payload: any = {}) =>
+    ({ lot, group, payload, updatedAt })
+
+  it('starts empty', async () => {
+    expect(await listOutbox()).toEqual([])
+  })
+
+  it('queues an entry', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    expect(await listOutbox()).toHaveLength(1)
+  })
+
+  it('collapses repeated edits to the same lot and group', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z', { n: 1 }))
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:05.000Z', { n: 2 }))
+    const out = await listOutbox()
+    expect(out).toHaveLength(1)
+    expect((out[0].payload as any).n).toBe(2)
+  })
+
+  it('keeps different field groups on the same lot separate', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await enqueue(entry(412, 'commercial', '2026-09-07T10:00:01.000Z'))
+    expect(await listOutbox()).toHaveLength(2)
+  })
+
+  it('never replaces a newer queued edit with an older one', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:05.000Z', { n: 'new' }))
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z', { n: 'old' }))
+    expect(((await listOutbox())[0].payload as any).n).toBe('new')
+  })
+
+  it('reports dirty state per lot and group', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    expect(await isDirty(412, 'inspection')).toBe(true)
+    expect(await isDirty(412, 'commercial')).toBe(false)
+    expect(await isDirty(999, 'inspection')).toBe(false)
+  })
+
+  it('dequeues only when the timestamp still matches', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await dequeue(412, 'inspection', '2026-09-07T10:00:00.000Z')
+    expect(await listOutbox()).toHaveLength(0)
+  })
+
+  it('keeps an edit made while its push was in flight', async () => {
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    // user edits again mid-flight
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:09.000Z'))
+    // the in-flight push completes and tries to clear the old version
+    await dequeue(412, 'inspection', '2026-09-07T10:00:00.000Z')
+    expect(await listOutbox()).toHaveLength(1)
+  })
+})
+```
+
+That last test is the one that matters most. Without the timestamp check in `dequeue`, a successful push silently discards whatever the inspector typed while it was in flight.
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `npm test -- db`
+Expected: FAIL — `Failed to resolve import "../db"`.
+
+- [ ] **Step 3: Create `src/lib/db.ts`**
+
+```ts
+import { get, set, del, keys, createStore } from 'idb-keyval'
+import type { MachineState } from '../types'
+
+const stateStore  = createStore('ehs-inspector', 'states')
+const outboxStore = createStore('ehs-inspector', 'outbox')
+const photoStore  = createStore('ehs-inspector', 'photos')
+
+export type FieldGroup = 'inspection' | 'commercial' | 'decision'
+
+export interface OutboxEntry {
+  lot: number
+  group: FieldGroup
+  payload: unknown
+  updatedAt: string   // ISO 8601
+}
+
+const outboxKey = (lot: number, group: FieldGroup) => `${lot}:${group}`
+
+export async function getState(lot: number): Promise<MachineState | null> {
+  return (await get<MachineState>(String(lot), stateStore)) ?? null
+}
+
+export async function putState(lot: number, state: MachineState): Promise<void> {
+  await set(String(lot), state, stateStore)
+}
+
+export async function getAllStates(): Promise<Record<number, MachineState>> {
+  const all: Record<number, MachineState> = {}
+  for (const k of await keys(stateStore)) {
+    const s = await get<MachineState>(k as string, stateStore)
+    if (s) all[Number(k)] = s
+  }
+  return all
+}
+
+export async function enqueue(entry: OutboxEntry): Promise<void> {
+  const key = outboxKey(entry.lot, entry.group)
+  const existing = await get<OutboxEntry>(key, outboxStore)
+  // Collapse to the newest edit. An out-of-order enqueue must not win.
+  if (existing && existing.updatedAt > entry.updatedAt) return
+  await set(key, entry, outboxStore)
+}
+
+export async function listOutbox(): Promise<OutboxEntry[]> {
+  const out: OutboxEntry[] = []
+  for (const k of await keys(outboxStore)) {
+    const e = await get<OutboxEntry>(k as string, outboxStore)
+    if (e) out.push(e)
+  }
+  return out.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+}
+
+/** Clears the entry only if it has not been superseded by a newer edit. */
+export async function dequeue(lot: number, group: FieldGroup, updatedAt: string): Promise<void> {
+  const key = outboxKey(lot, group)
+  const existing = await get<OutboxEntry>(key, outboxStore)
+  if (existing && existing.updatedAt === updatedAt) await del(key, outboxStore)
+}
+
+export async function isDirty(lot: number, group: FieldGroup): Promise<boolean> {
+  return (await get<OutboxEntry>(outboxKey(lot, group), outboxStore)) !== undefined
+}
+
+export async function putPhotoBlob(id: string, blob: Blob): Promise<void> {
+  await set(id, blob, photoStore)
+}
+export async function getPhotoBlob(id: string): Promise<Blob | null> {
+  return (await get<Blob>(id, photoStore)) ?? null
+}
+export async function deletePhotoBlob(id: string): Promise<void> {
+  await del(id, photoStore)
+}
+export async function listPendingPhotos(): Promise<string[]> {
+  return (await keys(photoStore)).map(String)
+}
+
+/** Test helper. Also used by the "reset this device" action in Settings. */
+export async function clearAll(): Promise<void> {
+  for (const store of [stateStore, outboxStore, photoStore]) {
+    for (const k of await keys(store)) await del(k as string, store)
+  }
+}
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `npm test -- db`
+Expected: PASS, 11 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add IndexedDB state cache and outbox queue"
+```
+
+---
+
+### Task 9: Sync worker
+
+**Files:**
+- Create: `src/lib/sync.ts`, `src/lib/__tests__/sync.test.ts`
+
+**Interfaces:**
+- Consumes: `supabase` (Task 6), `db.ts` (Task 8)
+- Produces:
+  - `type SyncStatus = 'synced' | 'pending' | 'offline' | 'error'`
+  - `interface SyncSnapshot { status: SyncStatus; pending: number; lastSyncedAt: string | null }`
+  - `drainOutbox(): Promise<{ pushed: number; failed: number }>`
+  - `pullAll(): Promise<Record<number, MachineState>>`
+  - `startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void`
+  - `subscribeStatus(fn: (s: SyncSnapshot) => void): () => void`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `src/lib/__tests__/sync.test.ts`. The Supabase client is mocked so the retry and ordering logic is tested without a network.
+
+```ts
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+const rpc = vi.fn()
+vi.mock('../supabase', () => ({
+  supabase: {
+    rpc,
+    from: () => ({ select: () => Promise.resolve({ data: [], error: null }) }),
+    channel: () => ({ on: () => ({ subscribe: () => ({}) }) }),
+    removeChannel: vi.fn(),
+  },
+  ensureSession: vi.fn(async () => 'uid-1'),
+}))
+
+import { clearAll, enqueue, listOutbox } from '../db'
+import { drainOutbox } from '../sync'
+
+beforeEach(async () => { await clearAll(); rpc.mockReset() })
+
+const entry = (lot: number, group: any, updatedAt: string) =>
+  ({ lot, group, payload: {}, updatedAt })
+
+describe('drainOutbox', () => {
+  it('does nothing when the outbox is empty', async () => {
+    expect(await drainOutbox()).toEqual({ pushed: 0, failed: 0 })
+    expect(rpc).not.toHaveBeenCalled()
+  })
+
+  it('pushes each queued entry once and clears it', async () => {
+    rpc.mockResolvedValue({ data: true, error: null })
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await enqueue(entry(413, 'commercial', '2026-09-07T10:00:01.000Z'))
+
+    expect(await drainOutbox()).toEqual({ pushed: 2, failed: 0 })
+    expect(rpc).toHaveBeenCalledTimes(2)
+    expect(await listOutbox()).toHaveLength(0)
+  })
+
+  it('calls sync_machine_state with the field group and client timestamp', async () => {
+    rpc.mockResolvedValue({ data: true, error: null })
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await drainOutbox()
+
+    expect(rpc).toHaveBeenCalledWith('sync_machine_state', {
+      p_lot: 412,
+      p_group: 'inspection',
+      p_payload: {},
+      p_client_updated_at: '2026-09-07T10:00:00.000Z',
+    })
+  })
+
+  it('keeps an entry queued when the push errors', async () => {
+    rpc.mockResolvedValue({ data: null, error: { message: 'network down' } })
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+
+    expect(await drainOutbox()).toEqual({ pushed: 0, failed: 1 })
+    expect(await listOutbox()).toHaveLength(1)
+  })
+
+  it('clears the entry even when the server rejects the write as stale', async () => {
+    // false means "a newer value already won" — retrying forever would be futile.
+    rpc.mockResolvedValue({ data: false, error: null })
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+
+    expect(await drainOutbox()).toEqual({ pushed: 1, failed: 0 })
+    expect(await listOutbox()).toHaveLength(0)
+  })
+
+  it('is safe to call twice with no double-push', async () => {
+    rpc.mockResolvedValue({ data: true, error: null })
+    await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await drainOutbox()
+    await drainOutbox()
+    expect(rpc).toHaveBeenCalledTimes(1)
+  })
+})
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `npm test -- sync`
+Expected: FAIL — `Failed to resolve import "../sync"`.
+
+- [ ] **Step 3: Create `src/lib/sync.ts`**
+
+```ts
+import { supabase } from './supabase'
+import { dequeue, listOutbox, putState, type FieldGroup } from './db'
+import type { MachineState } from '../types'
+
+export type SyncStatus = 'synced' | 'pending' | 'offline' | 'error'
+
+export interface SyncSnapshot {
+  status: SyncStatus
+  pending: number
+  lastSyncedAt: string | null
+}
+
+let snapshot: SyncSnapshot = { status: 'synced', pending: 0, lastSyncedAt: null }
+const listeners = new Set<(s: SyncSnapshot) => void>()
+let draining = false
+
+export function subscribeStatus(fn: (s: SyncSnapshot) => void): () => void {
+  listeners.add(fn)
+  fn(snapshot)
+  return () => { listeners.delete(fn) }
+}
+
+function emit(patch: Partial<SyncSnapshot>) {
+  snapshot = { ...snapshot, ...patch }
+  listeners.forEach(fn => fn(snapshot))
+}
+
+export async function refreshPending(): Promise<void> {
+  const pending = (await listOutbox()).length
+  const status: SyncStatus = !navigator.onLine ? 'offline' : pending ? 'pending' : 'synced'
+  emit({ pending, status })
+}
+
+/** Pushes every queued field-group. Safe to call repeatedly. */
+export async function drainOutbox(): Promise<{ pushed: number; failed: number }> {
+  if (draining) return { pushed: 0, failed: 0 }
+  draining = true
+  let pushed = 0, failed = 0
+
+  try {
+    for (const e of await listOutbox()) {
+      const { data, error } = await supabase.rpc('sync_machine_state', {
+        p_lot: e.lot,
+        p_group: e.group,
+        p_payload: e.payload,
+        p_client_updated_at: e.updatedAt,
+      })
+
+      if (error) { failed++; continue }   // stays queued, retried later
+      // data === false means the server already holds a newer value.
+      // Our copy is stale; clearing it is correct, retrying is not.
+      await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
+      pushed++
+      void data
+    }
+  } finally {
+    draining = false
+  }
+
+  await refreshPending()
+  if (pushed && !failed) emit({ lastSyncedAt: new Date().toISOString() })
+  if (failed) emit({ status: navigator.onLine ? 'error' : 'offline' })
+  return { pushed, failed }
+}
+
+function rowToState(row: any): MachineState {
+  return {
+    inspection: row.inspection ?? {},
+    commercial: row.commercial ?? {},
+    decision: row.decision,
+    shortlist: row.shortlist,
+  } as MachineState
+}
+
+export async function pullAll(): Promise<Record<number, MachineState>> {
+  const { data, error } = await supabase.from('machine_states').select('*')
+  if (error) throw error
+  const out: Record<number, MachineState> = {}
+  for (const row of data ?? []) out[row.lot] = rowToState(row)
+  return out
+}
+
+/**
+ * Starts background sync: drains on reconnect and on an interval, and applies
+ * inbound realtime rows. Returns a cleanup function.
+ */
+export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
+  const online  = () => { void refreshPending().then(() => drainOutbox()) }
+  const offline = () => emit({ status: 'offline' })
+
+  window.addEventListener('online', online)
+  window.addEventListener('offline', offline)
+
+  const timer = window.setInterval(() => { if (navigator.onLine) void drainOutbox() }, 15_000)
+
+  const channel = supabase
+    .channel('machine_states_stream')
+    .on('postgres_changes',
+        { event: '*', schema: 'public', table: 'machine_states' },
+        async payload => {
+          const row: any = payload.new
+          if (!row?.lot) return
+          const state = rowToState(row)
+          await putState(row.lot, state)
+          onRemoteState(row.lot, state)
+        })
+    .subscribe()
+
+  void refreshPending().then(() => { if (navigator.onLine) return drainOutbox() })
+
+  return () => {
+    window.removeEventListener('online', online)
+    window.removeEventListener('offline', offline)
+    window.clearInterval(timer)
+    void supabase.removeChannel(channel)
+  }
+}
+```
+
+The caller of `onRemoteState` is responsible for not clobbering a locally-dirty lot — that check lives in `useMachineState` (Task 10), which knows what the user is currently editing.
+
+- [ ] **Step 4: Run tests**
+
+Run: `npm test -- sync`
+Expected: PASS, 6 tests.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add background sync worker with outbox drain and realtime pull"
+```
+
+---
+
+### Task 10: Local-first state hook and App wiring
+
+Replaces the `useState(loadAll)` + `useEffect(localStorage.setItem)` pair at `src/App.tsx:81` and `:88`.
+
+**Files:**
+- Create: `src/hooks/useMachineState.ts`, `src/components/SyncBadge.tsx`
+- Modify: `src/App.tsx`
+
+**Interfaces:**
+- Consumes: `db.ts` (Task 8), `sync.ts` (Task 9), `blankState` (Task 2)
+- Produces:
+  - `useAllMachineStates(canWrite: boolean)` returning
+    `{ states: Record<number, MachineState>; ready: boolean; patchState(lot, group, fn): void }`
+  - `<SyncBadge />`
+
+- [ ] **Step 1: Create `src/hooks/useMachineState.ts`**
+
+```ts
+import { useCallback, useEffect, useRef, useState } from 'react'
+import type { MachineState } from '../types'
+import { blankState } from '../lib/calc'
+import { machines } from '../data'
+import { enqueue, getAllStates, isDirty, putState } from '../lib/db'
+import { drainOutbox, pullAll, startSync } from '../lib/sync'
+import type { FieldGroup } from '../lib/db'
+
+function seed(partial: Record<number, MachineState>): Record<number, MachineState> {
+  return Object.fromEntries(
+    machines.map(m => [m.lot, partial[m.lot] ? { ...blankState(), ...partial[m.lot] } : blankState()])
+  )
+}
+
+export function useAllMachineStates(canWrite: boolean) {
+  const [states, setStates] = useState<Record<number, MachineState>>(() => seed({}))
+  const [ready, setReady] = useState(false)
+  const dirtyRef = useRef<Set<string>>(new Set())
+
+  // Boot: local cache first (instant, works offline), then the server.
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const local = await getAllStates()
+      if (!cancelled) { setStates(seed(local)); setReady(true) }
+      try {
+        const remote = await pullAll()
+        if (cancelled) return
+        for (const [lot, state] of Object.entries(remote)) {
+          // Never overwrite a lot with unsent local edits.
+          if (dirtyRef.current.has(`${lot}:inspection`)) continue
+          await putState(Number(lot), state)
+        }
+        setStates(seed({ ...(await getAllStates()) }))
+      } catch { /* offline: the local cache stands */ }
+    })()
+    return () => { cancelled = true }
+  }, [])
+
+  // Realtime: apply inbound rows unless the lot is locally dirty.
+  useEffect(() => startSync(async (lot, remote) => {
+    const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+    const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
+    if (dirty.some(Boolean)) return
+    setStates(prev => ({ ...prev, [lot]: { ...blankState(), ...remote } }))
+  }), [])
+
+  const patchState = useCallback((lot: number, group: FieldGroup, fn: (s: MachineState) => MachineState) => {
+    if (!canWrite) return
+    const updatedAt = new Date().toISOString()
+
+    setStates(prev => {
+      const next = fn(prev[lot] ?? blankState())
+      const payload =
+        group === 'inspection' ? next.inspection :
+        group === 'commercial' ? next.commercial :
+        { decision: next.decision, shortlist: next.shortlist }
+
+      dirtyRef.current.add(`${lot}:${group}`)
+      // Fire-and-forget: the UI must not wait on storage or the network.
+      void putState(lot, next)
+      void enqueue({ lot, group, payload, updatedAt })
+        .then(() => { if (navigator.onLine) return drainOutbox() })
+        .finally(() => dirtyRef.current.delete(`${lot}:${group}`))
+
+      return { ...prev, [lot]: next }
+    })
+  }, [canWrite])
+
+  return { states, ready, patchState }
+}
+```
+
+- [ ] **Step 2: Create `src/components/SyncBadge.tsx`**
+
+```tsx
+import { useEffect, useState } from 'react'
+import { subscribeStatus, type SyncSnapshot } from '../lib/sync'
+
+const LABEL: Record<SyncSnapshot['status'], string> = {
+  synced:  'Synced',
+  pending: 'Saving',
+  offline: 'Offline',
+  error:   'Retrying',
+}
+
+export function SyncBadge() {
+  const [s, setS] = useState<SyncSnapshot>({ status: 'synced', pending: 0, lastSyncedAt: null })
+  useEffect(() => subscribeStatus(setS), [])
+
+  return (
+    <span className={`sync-badge sync-${s.status}`} title={
+      s.lastSyncedAt ? `Last synced ${new Date(s.lastSyncedAt).toLocaleTimeString()}` : 'Not synced yet'
+    }>
+      <i /> {LABEL[s.status]}{s.pending ? ` ${s.pending}` : ''}
+    </span>
+  )
+}
+```
+
+Offline must never look like an error. An inspector seeing a red warning while working normally in a dead spot will stop trusting the app.
+
+- [ ] **Step 3: Add badge styles to `src/styles.css`**
+
+```css
+.sync-badge { display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+  font-weight: 600; padding: 4px 9px; border-radius: 999px; background: #eef1f6; color: #45506b; }
+.sync-badge i { width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+.sync-synced  { background: #e7f6ec; color: #1a7f43; }
+.sync-pending { background: #fff4e0; color: #a4650a; }
+.sync-offline { background: #eef1f6; color: #56607a; }
+.sync-error   { background: #fdecea; color: #b42318; }
+```
+
+- [ ] **Step 4: Rewire `App.tsx`**
+
+Delete the `STORAGE_KEY` constant, `loadAll()`, the `useState(loadAll)` line and the `useEffect` that writes `localStorage`. Replace with:
+
+```tsx
+import { useAllMachineStates } from './hooks/useMachineState'
+import { SyncBadge } from './components/SyncBadge'
+import { can, type Profile } from './lib/profile'
+
+function App({ profile }: { profile: Profile }) {
+  const canWrite = can(profile.role, 'write_state')
+  const { states, ready, patchState } = useAllMachineStates(canWrite)
+  // …existing useState calls for tab, selectedLot, search, category, priority, detailLot
+```
+
+Every existing `patchState(lot, s => …)` call site now needs its field group as the second argument:
+
+- shortlist toggles → `patchState(m.lot, 'decision', s => ({ ...s, shortlist: !s.shortlist }))`
+- inspection scores, critical gates, inspector, inspectedAt, repairEstimateEur, notes → `'inspection'`
+- everything inside `CommercialForm` and the bid-board status dropdown → `'commercial'`
+- "Send to bid board" → two calls: `patchState(lot, 'decision', …)` then `patchState(lot, 'commercial', …)` if it touches both
+
+Add a loading guard before the main return:
+
+```tsx
+if (!ready) return <div className="gate"><p>Loading inspection data…</p></div>
+```
+
+Put the badge and the user's identity in the header, next to the existing Export button:
+
+```tsx
+<div className="header-actions">
+  <SyncBadge />
+  <Badge tone="live">Zevenbergen · 9 Sep</Badge>
+  <span className="who">{profile.display_name} · {profile.role}</span>
+  <button className="ghost" onClick={exportData}>Export</button>
+</div>
+```
+
+Pass `canWrite` down to `CommercialForm` and add `disabled={!canWrite}` to its inputs, the score buttons, the critical-gate buttons and the bid-board status select, so a viewer sees the data as read-only rather than clicking into a silent rejection.
+
+- [ ] **Step 5: Update the Settings tab copy and reset action**
+
+Replace the "Static MVP persistence" panel text with the shared model, and point the reset button at IndexedDB:
+
+```tsx
+import { clearAll } from './lib/db'
+
+<div className="panel danger-panel"><h3>Reset this device</h3>
+  <p>Clears the local cache and any unsent edits on this device. Data already
+     synced to the server is not affected.</p>
+  <button className="danger-button" onClick={async () => {
+    if (confirm('Clear local cache and unsent edits on this device?')) {
+      await clearAll(); location.reload()
+    }
+  }}>Reset local cache</button>
+</div>
+```
+
+- [ ] **Step 6: Verify**
+
+Run: `npm test && npx tsc --noEmit -p tsconfig.app.json && npm run build`
+Expected: all PASS, no type errors.
+
+Then `npm run dev` and check by hand: enter with the **inspector** code, score a section, confirm the badge goes `Saving` → `Synced`. Open the same URL in a second browser with the **viewer** code and confirm the score appears there within a few seconds and the controls are disabled.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "feat: replace localStorage with local-first IndexedDB state and sync"
+```
+
+---
+
+### Task 11: Photo capture and upload
+
+**Files:**
+- Create: `src/components/Photos.tsx`
+- Modify: `src/App.tsx` (inspection tab)
+
+**Interfaces:**
+- Consumes: `db.ts` photo helpers (Task 8), `supabase` storage
+- Produces: `<Photos lot={number} canWrite={boolean} profileId={string} />`
+
+- [ ] **Step 1: Create `src/components/Photos.tsx`**
+
+```tsx
+import { useCallback, useEffect, useState } from 'react'
+import { supabase } from '../lib/supabase'
+import { deletePhotoBlob, getPhotoBlob, listPendingPhotos, putPhotoBlob } from '../lib/db'
+
+interface Shot { id: string; url: string; pending: boolean }
+
+/** Downscale to a long edge of 1600px. Keeps a full-frame shot a few hundred KB. */
+function downscale(file: File): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = reject
+    reader.onload = () => {
+      const img = new Image()
+      img.onerror = reject
+      img.onload = () => {
+        const max = 1600
+        const scale = Math.min(1, max / Math.max(img.width, img.height))
+        const canvas = document.createElement('canvas')
+        canvas.width = Math.round(img.width * scale)
+        canvas.height = Math.round(img.height * scale)
+        canvas.getContext('2d')!.drawImage(img, 0, 0, canvas.width, canvas.height)
+        canvas.toBlob(b => b ? resolve(b) : reject(new Error('encode failed')), 'image/jpeg', 0.72)
+      }
+      img.src = String(reader.result)
+    }
+    reader.readAsDataURL(file)
+  })
+}
+
+export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: boolean; profileId: string }) {
+  const [shots, setShots] = useState<Shot[]>([])
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    const { data } = await supabase.from('photos')
+      .select('id, storage_path').eq('lot', lot).order('created_at', { ascending: false })
+
+    const uploaded: Shot[] = []
+    for (const row of data ?? []) {
+      const { data: signed } = await supabase.storage
+        .from('inspection-photos').createSignedUrl(row.storage_path, 3600)
+      if (signed?.signedUrl) uploaded.push({ id: row.id, url: signed.signedUrl, pending: false })
+    }
+
+    const pending: Shot[] = []
+    for (const id of await listPendingPhotos()) {
+      if (!id.startsWith(`${lot}/`)) continue
+      const blob = await getPhotoBlob(id)
+      if (blob) pending.push({ id, url: URL.createObjectURL(blob), pending: true })
+    }
+
+    setShots([...pending, ...uploaded])
+  }, [lot])
+
+  useEffect(() => { void load() }, [load])
+
+  const upload = async (id: string, blob: Blob) => {
+    const { error } = await supabase.storage
+      .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg' })
+    if (error) return                       // stays pending, retried on next load
+    await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
+    await deletePhotoBlob(id)
+  }
+
+  const onPick = async (files: FileList | null) => {
+    if (!files?.length) return
+    setBusy(true)
+    try {
+      for (const file of Array.from(files).slice(0, 6)) {
+        const blob = await downscale(file)
+        const id = `${lot}/${crypto.randomUUID()}.jpg`
+        await putPhotoBlob(id, blob)        // survives a crash or signal loss
+        await load()                        // show it immediately
+        if (navigator.onLine) await upload(id, blob)
+      }
+      await load()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  // Retry anything left pending whenever the connection returns.
+  useEffect(() => {
+    const retry = async () => {
+      for (const id of await listPendingPhotos()) {
+        if (!id.startsWith(`${lot}/`)) continue
+        const blob = await getPhotoBlob(id)
+        if (blob) await upload(id, blob)
+      }
+      await load()
+    }
+    window.addEventListener('online', retry)
+    return () => window.removeEventListener('online', retry)
+  })
+
+  return (
+    <div className="photos">
+      {canWrite && (
+        <label className="full">Photo evidence
+          <input type="file" accept="image/*" capture="environment" multiple
+                 disabled={busy} onChange={e => onPick(e.target.files)} />
+          <small>Stored on this device immediately, uploaded when there is signal.</small>
+        </label>
+      )}
+      {shots.length > 0 && (
+        <div className="photo-grid full">
+          {shots.map(s => (
+            <figure key={s.id} className={s.pending ? 'pending' : ''}>
+              <img src={s.url} alt={`Lot ${lot} inspection`} />
+              {s.pending && <figcaption>Waiting to upload</figcaption>}
+            </figure>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+```
+
+- [ ] **Step 2: Use it in the inspection tab of `App.tsx`**
+
+Where the old photo input and grid were (removed in Task 2), add:
+
+```tsx
+<Photos lot={selected.lot} canWrite={canWrite} profileId={profile.id} />
+```
+
+- [ ] **Step 3: Add styles to `src/styles.css`**
+
+```css
+.photo-grid figure { margin: 0; position: relative; }
+.photo-grid figure.pending img { opacity: .55; }
+.photo-grid figcaption { position: absolute; left: 6px; bottom: 6px; font-size: 11px;
+  background: rgba(0,0,0,.65); color: #fff; padding: 2px 6px; border-radius: 5px; }
+```
+
+- [ ] **Step 4: Verify by hand**
+
+`npm run dev`, enter as inspector, add a photo. Expected: it appears instantly with "Waiting to upload", then the caption disappears. Confirm the row landed:
+
+```bash
+npx supabase db execute --command "select lot, storage_path, created_at from public.photos order by created_at desc limit 5;"
+```
+
+Then open DevTools → Network → Offline, add another photo, and confirm it appears as pending and uploads when you go back online.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "feat: upload inspection photos to supabase storage with offline queue"
+```
+
+---
+
+### Task 12: Comment threads
+
+**Files:**
+- Create: `src/components/Comments.tsx`
+- Modify: `src/App.tsx`
+
+**Interfaces:**
+- Consumes: `supabase`, `Profile`
+- Produces: `<Comments lot={number} profile={Profile} />`, `useUnreadCounts(): Record<number, number>`
+
+- [ ] **Step 1: Create `src/components/Comments.tsx`**
+
+```tsx
+import { useCallback, useEffect, useState } from 'react'
+import { supabase } from '../lib/supabase'
+import type { Profile } from '../lib/profile'
+
+interface Comment {
+  id: string
+  lot: number
+  author_id: string | null
+  author_name: string
+  body: string
+  created_at: string
+}
+
+export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
+  const [items, setItems] = useState<Comment[]>([])
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const load = useCallback(async () => {
+    const { data } = await supabase.from('comments')
+      .select('*').eq('lot', lot).order('created_at', { ascending: true })
+    setItems((data ?? []) as Comment[])
+    await supabase.from('comment_reads')
+      .upsert({ profile_id: profile.id, lot, last_read_at: new Date().toISOString() })
+  }, [lot, profile.id])
+
+  useEffect(() => { void load() }, [load])
+
+  useEffect(() => {
+    const channel = supabase.channel(`comments_${lot}`)
+      .on('postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'comments', filter: `lot=eq.${lot}` },
+          payload => setItems(prev =>
+            prev.some(c => c.id === (payload.new as Comment).id)
+              ? prev
+              : [...prev, payload.new as Comment]))
+      .subscribe()
+    return () => { void supabase.removeChannel(channel) }
+  }, [lot])
+
+  const post = async (e: React.FormEvent) => {
+    e.preventDefault()
+    const body = draft.trim()
+    if (!body) return
+    setBusy(true)
+    const { error } = await supabase.from('comments').insert({
+      lot, author_id: profile.id, author_name: profile.display_name, body,
+    })
+    setBusy(false)
+    if (!error) { setDraft(''); await load() }
+  }
+
+  return (
+    <div className="panel comments">
+      <h3>Team comments</h3>
+      {items.length === 0 && <p className="muted">No comments on this lot yet.</p>}
+      <ul className="comment-list">
+        {items.map(c => (
+          <li key={c.id}>
+            <div className="comment-head">
+              <strong>{c.author_name}</strong>
+              <time>{new Date(c.created_at).toLocaleString()}</time>
+            </div>
+            <p>{c.body}</p>
+          </li>
+        ))}
+      </ul>
+      <form onSubmit={post} className="comment-form">
+        <textarea rows={3} value={draft} maxLength={4000}
+                  onChange={e => setDraft(e.target.value)}
+                  placeholder="Question or instruction for the inspection team…" />
+        <button className="primary" disabled={busy || !draft.trim()}>
+          {busy ? 'Posting…' : 'Post comment'}
+        </button>
+      </form>
+    </div>
+  )
+}
+
+/** Unread comment counts per lot, for the machine-card badge. */
+export function useUnreadCounts(profileId: string): Record<number, number> {
+  const [counts, setCounts] = useState<Record<number, number>>({})
+
+  useEffect(() => {
+    const compute = async () => {
+      const [{ data: reads }, { data: comments }] = await Promise.all([
+        supabase.from('comment_reads').select('lot, last_read_at').eq('profile_id', profileId),
+        supabase.from('comments').select('lot, created_at, author_id'),
+      ])
+      const readAt = new Map((reads ?? []).map(r => [r.lot, r.last_read_at]))
+      const next: Record<number, number> = {}
+      for (const c of comments ?? []) {
+        if (c.author_id === profileId) continue          // your own aren't unread
+        const seen = readAt.get(c.lot)
+        if (!seen || c.created_at > seen) next[c.lot] = (next[c.lot] ?? 0) + 1
+      }
+      setCounts(next)
+    }
+    void compute()
+
+    const channel = supabase.channel('comments_unread')
+      .on('postgres_changes',
+          { event: 'INSERT', schema: 'public', table: 'comments' },
+          () => { void compute() })
+      .subscribe()
+    return () => { void supabase.removeChannel(channel) }
+  }, [profileId])
+
+  return counts
+}
+```
+
+The 5-minute edit window from the spec is enforced by the RLS policy but no UI
+exposes editing yet — see Out of scope in the spec. Comments post straight
+through rather than via the outbox: they carry no merge problem, and a stale comment posted an hour late during a live auction is worse than one that visibly failed.
+
+- [ ] **Step 2: Mount the thread in the inspection tab**
+
+Below the field-notes panel in `App.tsx`:
+
+```tsx
+<Comments lot={selected.lot} profile={profile} />
+```
+
+- [ ] **Step 3: Show unread counts on machine cards**
+
+In `App`:
+
+```tsx
+const unread = useUnreadCounts(profile.id)
+```
+
+Pass `unread={unread[m.lot] ?? 0}` into each `<MachineCard>`, and inside `MachineCard` render it in the lot line:
+
+```tsx
+{unread > 0 && <span className="unread-dot">{unread}</span>}
+```
+
+- [ ] **Step 4: Add styles to `src/styles.css`**
+
+```css
+.comment-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+.comment-list li { background: #f6f8fb; border-radius: 10px; padding: 10px 12px; }
+.comment-head { display: flex; justify-content: space-between; gap: 8px;
+  font-size: 12px; color: #5b667f; }
+.comment-list p { margin: 5px 0 0; white-space: pre-wrap; }
+.comment-form { display: grid; gap: 8px; margin-top: 12px; }
+.unread-dot { background: #b42318; color: #fff; border-radius: 999px; font-size: 11px;
+  font-weight: 700; padding: 1px 7px; }
+```
+
+- [ ] **Step 5: Verify by hand**
+
+Two browsers: inspector in one, viewer in the other, same lot. Post from the viewer. Expected: it appears in the inspector's thread within a second or two without a refresh, and the machine card shows an unread badge until opened.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add -A
+git commit -m "feat: add per-lot comment threads with realtime and unread counts"
+```
+
+---
+
+### Task 13: One-time localStorage migration
+
+**Files:**
+- Create: `src/lib/migrate.ts`, `src/lib/__tests__/migrate.test.ts`
+- Modify: `src/App.tsx`
+
+**Interfaces:**
+- Consumes: `db.ts`, `sync.ts`
+- Produces:
+  - `readLegacyState(): Record<number, MachineState> | null` — null when there is nothing worth importing
+  - `importLegacy(): Promise<number>` — returns the number of lots queued, then marks the import done
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `src/lib/__tests__/migrate.test.ts`:
+
+```ts
+import { describe, it, expect, beforeEach } from 'vitest'
+import { blankState } from '../calc'
+import { readLegacyState, LEGACY_KEY } from '../migrate'
+
+beforeEach(() => { localStorage.clear() })
+
+describe('readLegacyState', () => {
+  it('returns null when there is no legacy key', () => {
+    expect(readLegacyState()).toBeNull()
+  })
+
+  it('returns null for unparseable data rather than throwing', () => {
+    localStorage.setItem(LEGACY_KEY, 'not json {{')
+    expect(readLegacyState()).toBeNull()
+  })
+
+  it('returns null when every lot is untouched', () => {
+    localStorage.setItem(LEGACY_KEY, JSON.stringify({ 412: blankState(), 413: blankState() }))
+    expect(readLegacyState()).toBeNull()
+  })
+
+  it('returns only the lots with real work on them', () => {
+    const touched = blankState()
+    touched.inspection.scores[Object.keys(touched.inspection.scores)[0]] = 4
+    localStorage.setItem(LEGACY_KEY, JSON.stringify({ 412: blankState(), 413: touched }))
+    expect(Object.keys(readLegacyState()!)).toEqual(['413'])
+  })
+
+  it('treats notes, a bid, a shortlist or a critical gate as real work', () => {
+    const withNotes = blankState(); withNotes.inspection.notes = 'boom weld cracked'
+    const withBid = blankState(); withBid.commercial.currentBidEur = 8000
+    const listed = blankState(); listed.shortlist = true
+    const gated = blankState(); gated.inspection.critical[Object.keys(gated.inspection.critical)[0]] = 'PASS'
+    localStorage.setItem(LEGACY_KEY, JSON.stringify({ 1: withNotes, 2: withBid, 3: listed, 4: gated }))
+    expect(Object.keys(readLegacyState()!).sort()).toEqual(['1', '2', '3', '4'])
+  })
+})
+```
+
+- [ ] **Step 2: Run to verify failure**
+
+Run: `npm test -- migrate`
+Expected: FAIL — `Failed to resolve import "../migrate"`.
+
+- [ ] **Step 3: Create `src/lib/migrate.ts`**
+
+```ts
+import type { MachineState } from '../types'
+import { enqueue, putState } from './db'
+import { drainOutbox } from './sync'
+
+export const LEGACY_KEY = 'ehs-auction-inspector-state-v1'
+export const MIGRATED_KEY = 'ehs-auction-inspector-migrated'
+
+function hasWork(s: MachineState): boolean {
+  if (!s) return false
+  if (s.shortlist) return true
+  if (Object.values(s.inspection?.scores ?? {}).some(v => v > 0)) return true
+  if (Object.values(s.inspection?.critical ?? {}).some(v => v !== 'UNSET')) return true
+  if ((s.inspection?.notes ?? '').trim()) return true
+  if (s.inspection?.repairEstimateEur) return true
+  if (s.commercial?.currentBidEur) return true
+  if (s.commercial?.estimatedResaleInr) return true
+  if (s.commercial?.manualMaxBidEur) return true
+  return false
+}
+
+/** Lots in the old localStorage blob that hold real work. Null if there are none. */
+export function readLegacyState(): Record<number, MachineState> | null {
+  if (localStorage.getItem(MIGRATED_KEY)) return null
+  const raw = localStorage.getItem(LEGACY_KEY)
+  if (!raw) return null
+
+  let parsed: Record<string, MachineState>
+  try { parsed = JSON.parse(raw) } catch { return null }
+  if (!parsed || typeof parsed !== 'object') return null
+
+  const out: Record<number, MachineState> = {}
+  for (const [lot, state] of Object.entries(parsed)) {
+    if (hasWork(state)) out[Number(lot)] = state
+  }
+  return Object.keys(out).length ? out : null
+}
+
+/** Queues every legacy lot for sync. Returns how many were imported. */
+export async function importLegacy(): Promise<number> {
+  const legacy = readLegacyState()
+  if (!legacy) { localStorage.setItem(MIGRATED_KEY, new Date().toISOString()); return 0 }
+
+  const updatedAt = new Date().toISOString()
+  for (const [lotKey, state] of Object.entries(legacy)) {
+    const lot = Number(lotKey)
+    await putState(lot, state)
+    await enqueue({ lot, group: 'inspection', payload: state.inspection, updatedAt })
+    await enqueue({ lot, group: 'commercial', payload: state.commercial, updatedAt })
+    await enqueue({ lot, group: 'decision', payload: { decision: state.decision, shortlist: state.shortlist }, updatedAt })
+  }
+
+  if (navigator.onLine) await drainOutbox()
+  localStorage.setItem(MIGRATED_KEY, new Date().toISOString())
+  return Object.keys(legacy).length
+}
+```
+
+The legacy key is **not deleted**. If the import goes wrong the original data is still on the device, which is worth more than a tidy `localStorage`.
+
+- [ ] **Step 4: Run tests**
+
+Run: `npm test -- migrate`
+Expected: PASS, 5 tests.
+
+- [ ] **Step 5: Offer the import in `App.tsx`**
+
+```tsx
+import { importLegacy, readLegacyState } from './lib/migrate'
+
+const [legacyCount, setLegacyCount] = useState(() => Object.keys(readLegacyState() ?? {}).length)
+
+{legacyCount > 0 && canWrite && (
+  <div className="legacy-banner">
+    <span>{legacyCount} lot{legacyCount > 1 ? 's' : ''} of inspection data
+      from this device has not been uploaded yet.</span>
+    <button className="primary" onClick={async () => {
+      await importLegacy(); setLegacyCount(0)
+    }}>Upload now</button>
+  </div>
+)}
+```
+
+Place it directly under `<nav className="nav-tabs">`. It is gated on `canWrite` because a viewer cannot write state and the RLS policy would reject the push.
+
+- [ ] **Step 6: Add the banner style**
+
+```css
+.legacy-banner { display: flex; gap: 12px; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; margin: 12px 16px; padding: 12px 14px; border-radius: 10px;
+  background: #fff4e0; color: #7a4b06; font-size: 13px; font-weight: 600; }
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add -A
+git commit -m "feat: import legacy localStorage inspection data on first run"
+```
+
+---
+
+### Task 14: Scripted RLS verification
+
+RLS bugs fail silently toward *too much* access. This is the only test in the plan that proves the security model actually holds.
+
+**Files:**
+- Create: `scripts/check-rls.mjs`
+- Modify: `package.json`
+
+**Interfaces:**
+- Consumes: the deployed database and all three access codes
+- Produces: `npm run check:rls` — exits non-zero if any assertion fails
+
+- [ ] **Step 1: Create `scripts/check-rls.mjs`**
+
+```js
+import { createClient } from '@supabase/supabase-js'
+
+const URL = process.env.VITE_SUPABASE_URL
+const KEY = process.env.VITE_SUPABASE_ANON_KEY
+const CODES = {
+  admin:     process.env.RLS_ADMIN_CODE,
+  inspector: process.env.RLS_INSPECTOR_CODE,
+  viewer:    process.env.RLS_VIEWER_CODE,
+}
+
+if (!URL || !KEY || Object.values(CODES).some(v => !v)) {
+  console.error('Set VITE_SUPABASE_URL, VITE_SUPABASE_ANON_KEY, RLS_ADMIN_CODE, RLS_INSPECTOR_CODE, RLS_VIEWER_CODE')
+  process.exit(2)
+}
+
+let failures = 0
+const check = (name, ok) => {
+  console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}`)
+  if (!ok) failures++
+}
+
+async function asRole(role) {
+  const client = createClient(URL, KEY, { auth: { persistSession: false } })
+  const { error: authErr } = await client.auth.signInAnonymously()
+  if (authErr) throw authErr
+  const { data, error } = await client.rpc('redeem_access_code', {
+    p_code: CODES[role], p_display_name: `rls-check-${role}`,
+  })
+  if (error) throw new Error(`${role} redemption failed: ${error.message}`)
+  if (data !== role) throw new Error(`${role} code granted "${data}"`)
+  return client
+}
+
+const lot = async client =>
+  (await client.from('machines').select('lot').limit(1).single()).data.lot
+
+// A device with a session but no redeemed code must see nothing.
+{
+  const anon = createClient(URL, KEY, { auth: { persistSession: false } })
+  await anon.auth.signInAnonymously()
+  const { data } = await anon.from('machines').select('lot')
+  check('no code: cannot read the catalog', (data ?? []).length === 0)
+  const { data: c } = await anon.from('comments').select('id')
+  check('no code: cannot read comments', (c ?? []).length === 0)
+}
+
+const viewer = await asRole('viewer')
+const inspector = await asRole('inspector')
+const target = await lot(inspector)
+
+{
+  const { data } = await viewer.from('machines').select('lot')
+  check('viewer: can read the catalog', (data ?? []).length > 0)
+
+  const { data: applied, error } = await viewer.rpc('sync_machine_state', {
+    p_lot: target, p_group: 'commercial',
+    p_payload: { currentBidEur: 999999 },
+    p_client_updated_at: new Date().toISOString(),
+  })
+  check('viewer: CANNOT write machine state', error !== null || applied === false)
+
+  const { error: mErr } = await viewer.from('machines').update({ notes: 'x' }).eq('lot', target)
+  const { data: after } = await viewer.from('machines').select('notes').eq('lot', target).single()
+  check('viewer: CANNOT edit the catalog', mErr !== null || after.notes !== 'x')
+
+  const { error: cErr } = await viewer.from('comments').insert({
+    lot: target, author_id: (await viewer.auth.getUser()).data.user.id,
+    author_name: 'rls-check-viewer', body: 'viewer comment from the RLS check',
+  })
+  check('viewer: CAN post a comment', cErr === null)
+
+  const { data: codes } = await viewer.from('access_codes').select('*')
+  check('viewer: CANNOT read access codes', (codes ?? []).length === 0)
+}
+
+{
+  const { data: applied, error } = await inspector.rpc('sync_machine_state', {
+    p_lot: target, p_group: 'commercial',
+    p_payload: { currentBidEur: 4242 },
+    p_client_updated_at: new Date().toISOString(),
+  })
+  check('inspector: CAN write machine state', error === null && applied === true)
+
+  const { data: stale } = await inspector.rpc('sync_machine_state', {
+    p_lot: target, p_group: 'commercial',
+    p_payload: { currentBidEur: 1 },
+    p_client_updated_at: '2020-01-01T00:00:00.000Z',
+  })
+  check('inspector: a stale write is rejected', stale === false)
+
+  const { error: mErr } = await inspector.from('machines').update({ notes: 'x' }).eq('lot', target)
+  const { data: after } = await inspector.from('machines').select('notes').eq('lot', target).single()
+  check('inspector: CANNOT edit the catalog', mErr !== null || after.notes !== 'x')
+
+  const { data: codes } = await inspector.from('access_codes').select('*')
+  check('inspector: CANNOT read access codes', (codes ?? []).length === 0)
+}
+
+console.log(failures ? `\n${failures} check(s) FAILED` : '\nAll RLS checks passed')
+process.exit(failures ? 1 : 0)
+```
+
+Note the assertion style: a rejected write is confirmed by **re-reading the row**, not by trusting the absence of an error. Postgres silently reports success for an UPDATE that matched zero rows under RLS, so checking `error === null` alone would pass even when the policy is missing.
+
+- [ ] **Step 2: Add the script to `package.json`**
+
+```json
+"check:rls": "node scripts/check-rls.mjs"
+```
+
+- [ ] **Step 3: Run it**
+
+```bash
+set -a && source .env && set +a
+RLS_ADMIN_CODE=... RLS_INSPECTOR_CODE=... RLS_VIEWER_CODE=... npm run check:rls
+```
+
+Expected: every line prints `PASS`, exit code 0. Any `FAIL` is a security hole — fix `0003_rls.sql` before continuing.
+
+- [ ] **Step 4: Clean up the check's test rows**
+
+```bash
+npx supabase db execute --command "
+delete from public.comments where author_name like 'rls-check-%';
+delete from public.profiles where display_name like 'rls-check-%';"
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add -A
+git commit -m "test: add scripted RLS verification across all three roles"
+```
+
+---
+
+### Task 15: Deploy to GitHub Pages
+
+**Files:**
+- Create: `.github/workflows/deploy.yml`
+- Modify: `vite.config.ts`, `README.md`, `public/sw.js`
+
+**Interfaces:**
+- Consumes: repo secrets `VITE_SUPABASE_URL`, `VITE_SUPABASE_ANON_KEY`
+- Produces: a live site on every push to `main`
+
+- [ ] **Step 1: Set the Pages base path in `vite.config.ts`**
+
+```ts
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+
+export default defineConfig({
+  plugins: [react()],
+  base: process.env.GITHUB_ACTIONS ? '/ehs-auction-inspector/' : '/',
+})
+```
+
+Replace `ehs-auction-inspector` with the actual repo name if it differs. A wrong base path produces a blank page with 404s on every asset — the most common Pages failure.
+
+- [ ] **Step 2: Create `.github/workflows/deploy.yml`**
+
+```yaml
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+        env:
+          VITE_SUPABASE_URL: ${{ secrets.VITE_SUPABASE_URL }}
+          VITE_SUPABASE_ANON_KEY: ${{ secrets.VITE_SUPABASE_ANON_KEY }}
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+`npm test` runs before the build on purpose: a failing calc regression should block the deploy, not ship.
+
+- [ ] **Step 3: Check the existing service worker**
+
+Open `public/sw.js`. If it caches the app shell with a hardcoded version string, bump it — a stale cached shell will keep serving the pre-Supabase bundle after deploy. Confirm it does **not** cache `*.supabase.co` requests; caching an API response would show inspectors stale inspection data with no indication it is old.
+
+- [ ] **Step 4: Create the repo and push**
+
+```bash
+gh repo create ehs-auction-inspector --public --source=. --remote=origin --push
+```
+
+- [ ] **Step 5: Add the secrets**
+
+```bash
+gh secret set VITE_SUPABASE_URL
+gh secret set VITE_SUPABASE_ANON_KEY
+```
+
+- [ ] **Step 6: Enable Pages**
+
+In the repo: **Settings → Pages → Build and deployment → Source → GitHub Actions**.
+
+- [ ] **Step 7: Verify the deploy**
+
+```bash
+gh run watch
+```
+
+Expected: both jobs green. Open the published URL on a phone, enter the inspector code, score a lot, and confirm it appears for a second device using the viewer code.
+
+- [ ] **Step 8: Update the README**
+
+Replace the "For a static GitHub Pages build, entered inspection data stays on the browser/device" line and the "Static MVP persistence" claims with the shared model: access codes per role, live sync, offline-first, comments. Add a short **Operations** section covering: rotating a code with `set_access_code`, the Frankfurt region, and the free-tier 7-day pause risk before an auction.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add -A
+git commit -m "feat: deploy to github pages via actions"
+git push
+```
+
+---
+
+## Post-implementation checklist
+
+- [ ] `npm test` green
+- [ ] `npm run check:rls` — every line PASS
+- [ ] Two devices, two different codes, live update confirmed both ways
+- [ ] Airplane mode: score a lot, take a photo, reconnect, confirm both sync
+- [ ] Viewer role: every write control visibly disabled, comment posting works
+- [ ] Legacy `localStorage` data imported and visible on a second device
+- [ ] Supabase project un-paused (or on a paid plan) before auction day
