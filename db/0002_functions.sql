@@ -7,7 +7,7 @@ create or replace function ehs.caller_role()
 returns text
 language sql
 security definer
-set search_path = ehs, public
+set search_path = ehs, public, extensions
 stable
 as $$
   select role from ehs.profiles where id = auth.uid();
@@ -21,7 +21,7 @@ create or replace function ehs.redeem_access_code(p_code text, p_display_name te
 returns text
 language plpgsql
 security definer
-set search_path = ehs, public
+set search_path = ehs, public, extensions
 as $$
 declare
   v_uid    uuid := auth.uid();
@@ -82,7 +82,7 @@ create or replace function ehs.set_access_code(p_role text, p_code text)
 returns void
 language plpgsql
 security definer
-set search_path = ehs, public
+set search_path = ehs, public, extensions
 as $$
 begin
   if ehs.caller_role() is distinct from 'admin' then
@@ -114,7 +114,7 @@ create or replace function ehs.sync_machine_state(
 ) returns boolean
 language plpgsql
 security invoker          -- runs as the caller, so RLS on machine_states applies
-set search_path = ehs, public
+set search_path = ehs, public, extensions
 as $$
 declare
   v_rows int := 0;
