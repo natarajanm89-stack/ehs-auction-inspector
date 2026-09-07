@@ -8,6 +8,7 @@ import { subscribeStatus } from './lib/sync'
 import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
 import { SignOut } from './components/SignOut'
+import { Photos } from './components/Photos'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'settings'
 
@@ -171,6 +172,7 @@ function App({ profile }: { profile: Profile }) {
               <label>Inspection time<input disabled={!canWrite} type="datetime-local" value={selectedState.inspection.inspectedAt} onChange={e=>patchState(selected.lot,'inspection',s=>({...s,inspection:{...s.inspection,inspectedAt:e.target.value}}))}/></label>
               <label>Repair reserve (€)<input disabled={!canWrite} type="number" value={selectedState.inspection.repairEstimateEur || ''} onChange={e=>patchState(selected.lot,'inspection',s=>({...s,inspection:{...s.inspection,repairEstimateEur:Number(e.target.value)}}))}/></label>
               <label className="full">Field notes<textarea disabled={!canWrite} rows={5} value={selectedState.inspection.notes} onChange={e=>patchState(selected.lot,'inspection',s=>({...s,inspection:{...s.inspection,notes:e.target.value}}))} placeholder="Leaks, noise, welds, battery dates, error codes, tyres, documents, parts needed…"/></label>
+              <Photos lot={selected.lot} canWrite={canWrite} profileId={profile.id} />
             </div>
           </div>
 

@@ -270,3 +270,8 @@ td select { min-width:110px; padding:7px; }
 .gate-card input { padding: 11px 12px; border: 1px solid #d6dae2; border-radius: 9px;
   font-size: 16px; }
 .gate-error { margin: 0; color: #b42318; font-size: 13px; }
+
+.photo-grid figure { margin: 0; position: relative; }
+.photo-grid figure.pending img { opacity: .55; }
+.photo-grid figcaption { position: absolute; left: 6px; bottom: 6px; font-size: 11px;
+  background: rgba(0,0,0,.65); color: #fff; padding: 2px 6px; border-radius: 5px; }
