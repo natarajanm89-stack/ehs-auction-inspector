@@ -26,16 +26,20 @@
   must be listed under **Settings → API → Data API → Exposed schemas** or every
   request 404s.
 - Supabase region: **eu-central-2 (Zurich)**, fixed. Shared with the existing app.
+- **Never run `supabase db push`, `db reset` or `db pull`.** The remote project holds
+  21 migrations owned by another application. All SQL here is applied with
+  `psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f <file>`, and our SQL lives in `db/`,
+  outside `supabase/migrations/`, so the CLI never touches it.
 - Commit after every task. Conventional-commit prefixes (`feat:`, `test:`, `chore:`, `refactor:`).
 
 ## File Structure
 
 | File | Responsibility |
 |---|---|
-| `supabase/migrations/0001_schema.sql` | Tables, indexes, enum-ish constraints |
-| `supabase/migrations/0002_functions.sql` | `redeem_access_code`, `sync_machine_state`, role helper |
-| `supabase/migrations/0003_rls.sql` | RLS policies for every table + storage bucket |
-| `supabase/seed_machines.sql` | Generated one-time catalog seed from `src/data.ts` |
+| `db/0001_schema.sql` | Tables, indexes, enum-ish constraints |
+| `db/0002_functions.sql` | `redeem_access_code`, `sync_machine_state`, role helper |
+| `db/0003_rls.sql` | RLS policies for every table + storage bucket |
+| `db/seed_machines.sql` | Generated one-time catalog seed from `src/data.ts` |
 | `src/lib/supabase.ts` | Client construction + anonymous session bootstrap |
 | `src/lib/profile.ts` | Profile fetch, role type, `redeemCode()` wrapper |
 | `src/lib/db.ts` | IndexedDB: state cache, photo blobs, outbox queue |
@@ -385,30 +389,37 @@ git commit -m "refactor: extract calc.ts with regression tests"
 ### Task 3: Database schema
 
 **Files:**
-- Create: `supabase/migrations/0001_schema.sql`, `scripts/gen-seed.mjs`, `supabase/seed_machines.sql`
+- Create: `db/0001_schema.sql`, `scripts/gen-seed.mjs`, `db/seed_machines.sql`
 
 **Interfaces:**
 - Consumes: `src/data.ts` (`machines` array) as the seed source
 - Produces: tables `profiles`, `access_codes`, `machines`, `machine_states`, `photos`, `comments`, `comment_reads`
 
-- [ ] **Step 1: Initialise the Supabase CLI project**
+- [ ] **Step 1: Confirm the CLI is already initialised and linked**
+
+The controller has already run `supabase init` and `supabase link --project-ref
+zxfyfigmajlvgbddlbbx`. Verify, do not repeat:
 
 ```bash
-npx supabase init
+test -f supabase/config.toml && echo linked-ok
 ```
 
-Expected: creates `supabase/config.toml`. Answer "n" to generating VS Code settings.
+- [ ] **Step 2: Confirm psql can reach the database**
 
-- [ ] **Step 2: Link to your existing project**
+**Do not use `supabase db push`.** The remote project carries 21 migrations
+belonging to an unrelated application; pushing would try to reconcile our work
+with that history. All SQL in this plan is applied directly with `psql`, which
+leaves the other app's migration history untouched.
 
 ```bash
-npx supabase login
-npx supabase link --project-ref <YOUR-PROJECT-REF>
+set -a && source .env && set +a
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select current_database(), current_user;"
 ```
 
-The project ref is the subdomain of your `VITE_SUPABASE_URL` (`https://<ref>.supabase.co`).
+Expected: one row. If `psql` is not on PATH, use
+`/opt/homebrew/opt/libpq/bin/psql`.
 
-- [ ] **Step 3: Write `supabase/migrations/0001_schema.sql`**
+- [ ] **Step 3: Write `db/0001_schema.sql`**
 
 ```sql
 create extension if not exists pgcrypto;
@@ -553,7 +564,7 @@ select lot from ehs.machines
 on conflict (lot) do nothing;
 `
 
-writeFileSync(new URL('../supabase/seed_machines.sql', import.meta.url), sql)
+writeFileSync(new URL('../db/seed_machines.sql', import.meta.url), sql)
 console.log(`wrote ${machines.length} machines`)
 ```
 
@@ -565,21 +576,25 @@ npx vite-node scripts/gen-seed.mjs
 
 (`vite-node` is already available via Vite; it resolves the `.ts` import that plain `node` cannot.)
 
-Expected: prints `wrote N machines`; `supabase/seed_machines.sql` exists.
+Expected: prints `wrote N machines`; `db/seed_machines.sql` exists.
 
-Verify the count matches the source: `grep -c '^  (' supabase/seed_machines.sql` should equal the number of entries in `src/data.ts`.
+Verify the count matches the source: `grep -c '^  (' db/seed_machines.sql` should equal the number of entries in `src/data.ts`.
 
 - [ ] **Step 6: Apply the schema and seed**
 
 ```bash
-npx supabase db push
-npx supabase db execute --file supabase/seed_machines.sql
+set -a && source .env && set +a
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0001_schema.sql
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/seed_machines.sql
 ```
+
+`ON_ERROR_STOP=1` matters: without it psql reports success after a failed
+statement, and you would seed into a half-built schema.
 
 - [ ] **Step 7: Verify the tables exist and are seeded**
 
 ```bash
-npx supabase db execute --command "select count(*) as machines from ehs.machines; select count(*) as states from ehs.machine_states;"
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select count(*) as machines from ehs.machines; select count(*) as states from ehs.machine_states;"
 ```
 
 Expected: both counts equal the number of lots in `src/data.ts`.
@@ -598,7 +613,7 @@ git commit -m "feat: add supabase schema and catalog seed"
 Two functions carry the whole design: one is the only path to a role, the other is the only path to writing state.
 
 **Files:**
-- Create: `supabase/migrations/0002_functions.sql`
+- Create: `db/0002_functions.sql`
 
 **Interfaces:**
 - Consumes: tables from Task 3
@@ -608,7 +623,7 @@ Two functions carry the whole design: one is the only path to a role, the other 
   - `ehs.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
   - `ehs.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
 
-- [ ] **Step 1: Write `supabase/migrations/0002_functions.sql`**
+- [ ] **Step 1: Write `db/0002_functions.sql`**
 
 ```sql
 -- Reads the caller's role without triggering the profiles RLS policy.
@@ -773,7 +788,8 @@ grant execute on function ehs.sync_machine_state(int, text, jsonb, timestamptz) 
 - [ ] **Step 2: Apply the migration**
 
 ```bash
-npx supabase db push
+set -a && source .env && set +a
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0002_functions.sql
 ```
 
 - [ ] **Step 3: Seed the three access codes**
@@ -781,7 +797,7 @@ npx supabase db push
 Pick three distinct codes. Replace the placeholders below with your real ones — and do not commit them anywhere.
 
 ```bash
-npx supabase db execute --command "
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
 insert into ehs.access_codes (role, code_hash) values
   ('admin',     crypt('CHOOSE-ADMIN-CODE',     gen_salt('bf'))),
   ('inspector', crypt('CHOOSE-INSPECTOR-CODE', gen_salt('bf'))),
@@ -792,7 +808,7 @@ on conflict (role) do update set code_hash = excluded.code_hash;"
 - [ ] **Step 4: Verify the codes match and the plaintext is unrecoverable**
 
 ```bash
-npx supabase db execute --command "
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
 select role, code_hash = crypt('CHOOSE-INSPECTOR-CODE', code_hash) as matches,
        left(code_hash, 7) as hash_prefix
   from ehs.access_codes order by role;"
@@ -803,7 +819,7 @@ Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix`
 - [ ] **Step 5: Verify stale writes are rejected**
 
 ```bash
-npx supabase db execute --command "
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
 select ehs.sync_machine_state(
   (select min(lot) from ehs.machines), 'commercial',
   '{\"currentBidEur\": 999}'::jsonb, '1999-01-01T00:00:00Z') as should_be_false;"
@@ -825,13 +841,13 @@ git commit -m "feat: add access code redemption and state sync functions"
 Every table currently has RLS on with zero policies, which means nobody can read anything. This task defines who can do what.
 
 **Files:**
-- Create: `supabase/migrations/0003_rls.sql`
+- Create: `db/0003_rls.sql`
 
 **Interfaces:**
 - Consumes: `ehs.caller_role()` from Task 4
 - Produces: a private `inspection-photos` storage bucket and policies on all eight tables
 
-- [ ] **Step 1: Write `supabase/migrations/0003_rls.sql`**
+- [ ] **Step 1: Write `db/0003_rls.sql`**
 
 ```sql
 -- profiles: everyone with a profile can see the team; you edit only your own
@@ -942,13 +958,14 @@ create policy photos_storage_delete on storage.objects
 - [ ] **Step 2: Apply**
 
 ```bash
-npx supabase db push
+set -a && source .env && set +a
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f db/0003_rls.sql
 ```
 
 - [ ] **Step 3: Verify every table has RLS enabled**
 
 ```bash
-npx supabase db execute --command "
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
 select tablename, rowsecurity
   from pg_tables where schemaname = 'ehs' order by tablename;"
 ```
@@ -958,7 +975,7 @@ Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
 - [ ] **Step 4: Verify the two locked tables have no policies**
 
 ```bash
-npx supabase db execute --command "
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
 select tablename, count(*) as policies
   from pg_policies where schemaname = 'ehs'
  group by tablename order by tablename;"
@@ -1102,7 +1119,7 @@ export type Action = 'write_state' | 'write_catalog' | 'comment'
 
 /**
  * UI convenience only. The authoritative check is the RLS policy in
- * supabase/migrations/0003_rls.sql — never rely on this for security.
+ * db/0003_rls.sql — never rely on this for security.
  */
 export function can(role: Role | null, action: Action): boolean {
   if (!role) return false
@@ -2111,7 +2128,7 @@ Where the old photo input and grid were (removed in Task 2), add:
 `npm run dev`, enter as inspector, add a photo. Expected: it appears instantly with "Waiting to upload", then the caption disappears. Confirm the row landed:
 
 ```bash
-npx supabase db execute --command "select lot, storage_path, created_at from ehs.photos order by created_at desc limit 5;"
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "select lot, storage_path, created_at from ehs.photos order by created_at desc limit 5;"
 ```
 
 Then open DevTools → Network → Offline, add another photo, and confirm it appears as pending and uploads when you go back online.
@@ -2608,7 +2625,7 @@ Expected: every line prints `PASS`, exit code 0. Any `FAIL` is a security hole �
 - [ ] **Step 4: Clean up the check's test rows**
 
 ```bash
-npx supabase db execute --command "
+psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -c "
 delete from ehs.comments where author_name like 'rls-check-%';
 delete from ehs.profiles where display_name like 'rls-check-%';"
 ```
