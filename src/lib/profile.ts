@@ -23,10 +23,41 @@ export function can(role: Role | null, action: Action): boolean {
   }
 }
 
+const PROFILE_CACHE_KEY = 'ehs-profile-v1'
+
+/**
+ * The last known profile, cached so the app opens offline. Role here is a UI
+ * convenience only - the server re-checks every request against RLS, so a
+ * tampered cache grants nothing.
+ */
+export function cachedProfile(): Profile | null {
+  try {
+    const raw = localStorage.getItem(PROFILE_CACHE_KEY)
+    if (!raw) return null
+    const p = JSON.parse(raw)
+    return p && typeof p.id === 'string' && typeof p.display_name === 'string'
+      && (p.role === 'admin' || p.role === 'inspector' || p.role === 'viewer')
+      ? p as Profile
+      : null
+  } catch {
+    return null
+  }
+}
+
+export function cacheProfile(p: Profile | null): void {
+  try {
+    if (p) localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(p))
+    else localStorage.removeItem(PROFILE_CACHE_KEY)
+  } catch { /* private mode or quota: the app still works, just re-prompts */ }
+}
+
 export async function fetchProfile(): Promise<Profile | null> {
   const { data: session } = await supabase.auth.getSession()
   const uid = session.session?.user?.id
-  if (!uid) return null
+  if (!uid) {
+    cacheProfile(null)
+    return null
+  }
 
   const { data, error } = await supabase
     .from('profiles')
@@ -35,7 +66,9 @@ export async function fetchProfile(): Promise<Profile | null> {
     .maybeSingle()
 
   if (error) throw error
-  return (data as Profile) ?? null
+  const result = (data as Profile) ?? null
+  cacheProfile(result)
+  return result
 }
 
 export async function redeemCode(code: string, displayName: string): Promise<Role> {

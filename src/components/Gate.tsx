@@ -1,30 +1,58 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ensureSession } from '../lib/supabase'
-import { fetchProfile, redeemCode, type Profile } from '../lib/profile'
+import { cachedProfile, cacheProfile, fetchProfile, redeemCode, type Profile } from '../lib/profile'
 
 export function Gate({ children }: { children: (profile: Profile) => React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [booting, setBooting] = useState(true)
+  const [offline, setOffline] = useState(false)
   const [code, setCode] = useState('')
   const [name, setName] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const submitting = useRef(false)
+
+  const boot = useCallback(async () => {
+    setOffline(false)
+    const cached = cachedProfile()
+    if (cached) {
+      setProfile(cached)
+      setBooting(false)
+    } else {
+      setBooting(true)
+    }
+
+    try {
+      await ensureSession()
+      const fresh = await fetchProfile()
+      if (fresh) {
+        setProfile(fresh)
+      } else {
+        // Authoritative: server says no profile. Clear any stale cache.
+        cacheProfile(null)
+        setProfile(null)
+      }
+      setError('')
+    } catch (e) {
+      if (!cached) {
+        setOffline(true)
+        setError(e instanceof Error ? e.message : 'Could not reach the server.')
+      }
+      // If we have a cached profile, keep showing the app - the refresh
+      // failed but there's nothing to correct for yet.
+    } finally {
+      setBooting(false)
+    }
+  }, [])
 
   useEffect(() => {
-    ;(async () => {
-      try {
-        await ensureSession()
-        setProfile(await fetchProfile())
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not reach the server.')
-      } finally {
-        setBooting(false)
-      }
-    })()
-  }, [])
+    boot()
+  }, [boot])
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (submitting.current) return
+    submitting.current = true
     setError('')
     setBusy(true)
     try {
@@ -33,12 +61,28 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not verify that code.')
     } finally {
+      submitting.current = false
       setBusy(false)
     }
   }
 
   if (booting) return <div className="gate"><p>Starting…</p></div>
   if (profile) return <>{children(profile)}</>
+
+  if (offline) {
+    return (
+      <div className="gate">
+        <div className="gate-card">
+          <div className="brand-mark">EHS</div>
+          <h1>Auction Inspector</h1>
+          <p className="gate-error" role="alert">
+            Can't reach the server. Check your connection and try again.
+          </p>
+          <button className="primary wide" onClick={() => boot()}>Retry</button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="gate">
@@ -49,7 +93,8 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
 
         <label>Access code
           <input value={code} onChange={e => setCode(e.target.value)}
-                 autoComplete="off" autoCapitalize="none" required />
+                 autoComplete="off" autoCapitalize="none" autoCorrect="off"
+                 spellCheck={false} required />
         </label>
 
         <label>Your name
