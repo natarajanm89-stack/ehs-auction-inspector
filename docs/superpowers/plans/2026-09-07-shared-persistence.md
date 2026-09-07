@@ -2211,6 +2211,29 @@ Put the badge and the user's identity in the header, next to the existing Export
 </div>
 ```
 
+**Viewer banner.** Disabled controls with no explanation read as a broken app, and
+someone will waste time at an auction trying to fix it instead of realising they
+are on the wrong code. Add above the inspection layout, and again above the bid
+board table:
+
+```tsx
+{!canWrite && (
+  <div className="viewer-note" role="status">
+    You are signed in as a <strong>viewer</strong>. You can read everything and
+    post comments, but not change inspection data.
+  </div>
+)}
+```
+
+```css
+.viewer-note { margin: 0 0 14px; padding: 10px 14px; border-radius: 10px;
+  background: #eef3fb; color: #2c4a7c; font-size: 13px; font-weight: 600; }
+```
+
+Controls are **disabled, not hidden**, so a viewer in India and an inspector in
+Moerdijk see the same screen layout while talking on the phone. The comment
+composer stays fully enabled - commenting is the viewer's actual job.
+
 Pass `canWrite` down to `CommercialForm` and add `disabled={!canWrite}` to its inputs, the score buttons, the critical-gate buttons and the bid-board status select, so a viewer sees the data as read-only rather than clicking into a silent rejection.
 
 - [ ] **Step 4b: Sign out (Settings tab)**
