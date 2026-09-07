@@ -46,5 +46,6 @@ export async function redeemCode(code: string, displayName: string): Promise<Rol
   if (error) throw new Error(error.message)
   if (data === 'invalid_code') throw new Error('That access code is not recognised.')
   if (data === 'rate_limited') throw new Error('Too many attempts. Wait 15 minutes and try again.')
-  return data as Role
+  if (data === 'admin' || data === 'inspector' || data === 'viewer') return data
+  throw new Error('Unexpected response from the server. Try again.')
 }

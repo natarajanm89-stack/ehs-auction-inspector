@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js'
+import { assertNotServiceRole } from './keyGuard'
 
 const url = import.meta.env.VITE_SUPABASE_URL
 const key = import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -9,41 +10,35 @@ if (!url || !key) {
   )
 }
 
-// Refuse to run with a service_role key. It bypasses row-level security
-// entirely, so shipping one would expose every table in the project - including
-// the unrelated application sharing this database - to anyone who opens the site.
-function assertNotServiceRole(k: string): void {
-  const parts = k.split('.')
-  if (parts.length !== 3) return           // non-JWT publishable key: fine
-  try {
-    const pad = parts[1] + '='.repeat((4 - (parts[1].length % 4)) % 4)
-    const claims = JSON.parse(atob(pad.replace(/-/g, '+').replace(/_/g, '/')))
-    if (claims.role === 'service_role') {
-      const msg =
-        'VITE_SUPABASE_ANON_KEY is a service_role key. Use the anon/public key - ' +
-        'the service key bypasses row-level security and must never reach a browser.'
-      // Fatal in a production build, which is what gets published. In dev it is
-      // only a warning, so local work can continue while the key is being sorted
-      // out - but note RLS is NOT being exercised honestly while it is in use.
-      if (import.meta.env.PROD) throw new Error(msg)
-      console.error('[ehs] ' + msg)
-      return
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message.startsWith('VITE_SUPABASE_ANON_KEY')) throw e
-    // Unparseable payload: not our concern, let the client surface any real error.
-  }
-}
-
-assertNotServiceRole(key)
+// Fatal in a production build, which is what gets published. In dev it is only a
+// warning, so local work can continue while the key is being sorted out - but
+// note RLS is NOT being exercised honestly while a service_role key is in use.
+const keyWarning = assertNotServiceRole(key, import.meta.env.PROD)
+if (keyWarning) console.error('[ehs] ' + keyWarning)
 
 export const supabase = createClient(url, key, {
   db: { schema: 'ehs' },   // this project's public schema belongs to another app
   auth: { persistSession: true, autoRefreshToken: true },
 })
 
-/** Returns the anonymous user id, creating a session on first run. */
-export async function ensureSession(): Promise<string> {
+let sessionPromise: Promise<string> | null = null
+
+/**
+ * Returns the anonymous user id, creating a session on first run.
+ * The in-flight promise is shared so concurrent callers on a cold start do not
+ * each trigger a separate anonymous sign-in.
+ */
+export function ensureSession(): Promise<string> {
+  if (!sessionPromise) {
+    sessionPromise = bootstrapSession().finally(() => { sessionPromise = null })
+  }
+  return sessionPromise
+}
+
+// getSession() in supabase-js v2 refreshes an expired session itself and returns
+// null if the refresh token has been revoked, so a revoked session falls through
+// to a fresh anonymous sign-in below.
+async function bootstrapSession(): Promise<string> {
   const { data: existing } = await supabase.auth.getSession()
   if (existing.session?.user) return existing.session.user.id
 

@@ -40,6 +40,7 @@
 | `db/0002_functions.sql` | `redeem_access_code`, `sync_machine_state`, role helper |
 | `db/0003_rls.sql` | RLS policies for every table + storage bucket |
 | `db/seed_machines.sql` | Generated one-time catalog seed from `src/data.ts` |
+| `src/lib/keyGuard.ts` | Pure, testable service_role key guard |
 | `src/lib/supabase.ts` | Client construction + anonymous session bootstrap |
 | `src/lib/profile.ts` | Profile fetch, role type, `redeemCode()` wrapper |
 | `src/lib/db.ts` | IndexedDB: state cache, photo blobs, outbox queue |
@@ -1068,7 +1069,8 @@ git commit -m "feat: add row-level security policies and photo storage bucket"
 ### Task 6: Supabase client and anonymous session
 
 **Files:**
-- Create: `src/lib/supabase.ts`, `src/lib/profile.ts`, `src/lib/__tests__/profile.test.ts`
+- Create: `src/lib/keyGuard.ts`, `src/lib/supabase.ts`, `src/lib/profile.ts`
+- Create: `src/lib/__tests__/keyGuard.test.ts`, `src/lib/__tests__/profile.test.ts`
 - Create: `src/vite-env.d.ts`
 
 **Interfaces:**
@@ -1135,10 +1137,107 @@ describe('can', () => {
 Run: `npm test -- profile`
 Expected: FAIL — `Failed to resolve import "../profile"`.
 
-- [ ] **Step 4: Create `src/lib/supabase.ts`**
+- [ ] **Step 4a: Write the failing test for the service_role key guard**
+
+`assertNotServiceRole` is pure (env-access happens at the call site, not inside
+the function), so it is directly unit-testable. Create
+`src/lib/__tests__/keyGuard.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { assertNotServiceRole } from '../keyGuard'
+
+const jwt = (claims: object) => {
+  const b64 = (o: object) =>
+    btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return `${b64({ alg: 'HS256' })}.${b64(claims)}.sig`
+}
+
+describe('assertNotServiceRole', () => {
+  it('throws in prod for a service_role key, mentioning the anon key', () => {
+    const key = jwt({ role: 'service_role' })
+    expect(() => assertNotServiceRole(key, true)).toThrow(/anon/i)
+  })
+
+  it('returns a warning message (does not throw) in dev for a service_role key', () => {
+    const key = jwt({ role: 'service_role' })
+    expect(assertNotServiceRole(key, false)).toMatch(/service_role/i)
+  })
+
+  it('returns null for an anon-role key in dev and prod', () => {
+    const key = jwt({ role: 'anon' })
+    expect(assertNotServiceRole(key, false)).toBeNull()
+    expect(assertNotServiceRole(key, true)).toBeNull()
+  })
+
+  it('returns null for a non-JWT publishable key', () => {
+    expect(assertNotServiceRole('sb_publishable_abc123', true)).toBeNull()
+  })
+
+  it('returns null for malformed keys instead of throwing', () => {
+    expect(assertNotServiceRole('not.a.jwt', true)).toBeNull()
+    expect(assertNotServiceRole('a.!!!not-base64!!!.c', true)).toBeNull()
+  })
+
+  it('returns null for a JWT with no role claim', () => {
+    const key = jwt({ sub: 'user123' })
+    expect(assertNotServiceRole(key, true)).toBeNull()
+  })
+})
+```
+
+Run: `npm test -- keyGuard`
+Expected: FAIL — `Failed to resolve import "../keyGuard"`.
+
+- [ ] **Step 4b: Create `src/lib/keyGuard.ts`**
+
+```ts
+/**
+ * Guards against shipping a Supabase service_role key to the browser. That key
+ * bypasses row-level security entirely, and this project's database is shared
+ * with an unrelated application, so a published bundle carrying one would expose
+ * every table in the project.
+ *
+ * Pure by design: `isProd` is passed in rather than read from import.meta.env,
+ * so the behaviour is directly testable.
+ *
+ * @returns a warning message when the key is a service_role key in development,
+ *          or null when the key is acceptable.
+ * @throws  when the key is a service_role key and `isProd` is true.
+ */
+export function assertNotServiceRole(key: string, isProd: boolean): string | null {
+  if (roleFromJwt(key) !== 'service_role') return null
+
+  const msg =
+    'VITE_SUPABASE_ANON_KEY is a service_role key. Use the anon/public key - ' +
+    'the service key bypasses row-level security and must never reach a browser.'
+  if (isProd) throw new Error(msg)
+  return msg
+}
+
+/** The `role` claim of a JWT, or null for a non-JWT or unparseable key. */
+function roleFromJwt(key: string): string | null {
+  const parts = key.split('.')
+  if (parts.length !== 3) return null      // sb_publishable_... style key
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4)
+    const claims = JSON.parse(atob(padded))
+    return typeof claims.role === 'string' ? claims.role : null
+  } catch {
+    return null
+  }
+}
+```
+
+Run: `npm test -- keyGuard`
+Expected: PASS.
+
+- [ ] **Step 4c: Create `src/lib/supabase.ts`**
 
 ```ts
 import { createClient } from '@supabase/supabase-js'
+import { assertNotServiceRole } from './keyGuard'
 
 const url = import.meta.env.VITE_SUPABASE_URL
 const key = import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -1149,41 +1248,35 @@ if (!url || !key) {
   )
 }
 
-// Refuse to run with a service_role key. It bypasses row-level security
-// entirely, so shipping one would expose every table in the project - including
-// the unrelated application sharing this database - to anyone who opens the site.
-function assertNotServiceRole(k: string): void {
-  const parts = k.split('.')
-  if (parts.length !== 3) return           // non-JWT publishable key: fine
-  try {
-    const pad = parts[1] + '='.repeat((4 - (parts[1].length % 4)) % 4)
-    const claims = JSON.parse(atob(pad.replace(/-/g, '+').replace(/_/g, '/')))
-    if (claims.role === 'service_role') {
-      const msg =
-        'VITE_SUPABASE_ANON_KEY is a service_role key. Use the anon/public key - ' +
-        'the service key bypasses row-level security and must never reach a browser.'
-      // Fatal in a production build, which is what gets published. In dev it is
-      // only a warning, so local work can continue while the key is being sorted
-      // out - but note RLS is NOT being exercised honestly while it is in use.
-      if (import.meta.env.PROD) throw new Error(msg)
-      console.error('[ehs] ' + msg)
-      return
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message.startsWith('VITE_SUPABASE_ANON_KEY')) throw e
-    // Unparseable payload: not our concern, let the client surface any real error.
-  }
-}
-
-assertNotServiceRole(key)
+// Fatal in a production build, which is what gets published. In dev it is only a
+// warning, so local work can continue while the key is being sorted out - but
+// note RLS is NOT being exercised honestly while a service_role key is in use.
+const keyWarning = assertNotServiceRole(key, import.meta.env.PROD)
+if (keyWarning) console.error('[ehs] ' + keyWarning)
 
 export const supabase = createClient(url, key, {
   db: { schema: 'ehs' },   // this project's public schema belongs to another app
   auth: { persistSession: true, autoRefreshToken: true },
 })
 
-/** Returns the anonymous user id, creating a session on first run. */
-export async function ensureSession(): Promise<string> {
+let sessionPromise: Promise<string> | null = null
+
+/**
+ * Returns the anonymous user id, creating a session on first run.
+ * The in-flight promise is shared so concurrent callers on a cold start do not
+ * each trigger a separate anonymous sign-in.
+ */
+export function ensureSession(): Promise<string> {
+  if (!sessionPromise) {
+    sessionPromise = bootstrapSession().finally(() => { sessionPromise = null })
+  }
+  return sessionPromise
+}
+
+// getSession() in supabase-js v2 refreshes an expired session itself and returns
+// null if the refresh token has been revoked, so a revoked session falls through
+// to a fresh anonymous sign-in below.
+async function bootstrapSession(): Promise<string> {
   const { data: existing } = await supabase.auth.getSession()
   if (existing.session?.user) return existing.session.user.id
 
@@ -1244,7 +1337,8 @@ export async function redeemCode(code: string, displayName: string): Promise<Rol
   if (error) throw new Error(error.message)
   if (data === 'invalid_code') throw new Error('That access code is not recognised.')
   if (data === 'rate_limited') throw new Error('Too many attempts. Wait 15 minutes and try again.')
-  return data as Role
+  if (data === 'admin' || data === 'inspector' || data === 'viewer') return data
+  throw new Error('Unexpected response from the server. Try again.')
 }
 ```
 
