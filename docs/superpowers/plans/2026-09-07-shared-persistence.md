@@ -3420,3 +3420,59 @@ git push
 - [ ] Viewer role: every write control visibly disabled, comment posting works
 - [ ] Legacy `localStorage` data imported and visible on a second device
 - [ ] Supabase project un-paused (or on a paid plan) before auction day
+
+## Post-review fixes (2026-09-08, pre-deployment)
+
+A final pre-deployment review found six correctness gaps, all fixed on
+`feat/shared-persistence` with the test suite kept green (68 → 75 tests).
+These amend the task descriptions above:
+
+- **Task 10 (`useMachineState`, boot pull)** — the boot effect's final
+  `setStates(seed({ ...(await getAllStates()) }))` replaced `states`
+  wholesale, ignoring `touchedRef` and reverting any edit typed while
+  `pullAll()` was still in flight (and poisoning `statesRef` for the next
+  keystroke). Fixed by merging: `setStates(prev => ...)` now builds from the
+  freshly-read cache but keeps `prev[lot]` for every lot in `touchedRef`.
+
+- **Task 10 (`useMachineState`, `patchState`)** — `patchState` computed
+  `next` from `statesRef.current` but committed via
+  `setStates(prev => ({ ...prev, [lot]: next }))`, so two patches dispatched
+  in the same React batch could lose the first one's value, in both the
+  in-memory cache and the outbox payload. Fixed with a `draftRef` that
+  synchronously tracks the latest value written per lot (React does not
+  guarantee a functional `setState` updater runs synchronously with the
+  call, so `prev` inside the updater can't safely be the source of truth
+  either); `patchState` now derives `next` from `draftRef` (falling back to
+  `statesRef`), so back-to-back calls compose correctly.
+
+- **Task 11 (`Photos.tsx`, upload)** — uploads used `{ upsert: true }`, which
+  is an UPDATE on `storage.objects`; the bucket's RLS policies (Task 9) grant
+  only SELECT/INSERT/DELETE, so a retry of a partially-succeeded upload (the
+  bytes landed, the response didn't) was denied forever. Fixed by dropping
+  `upsert` and treating a 409 / "already exists" upload error as success,
+  falling through to the same idempotent row-insert path already used for
+  `23505`. No storage policy changed.
+
+- **Task 11 (`Photos.tsx`, retry scope)** — the `online` retry listener only
+  drained pending photos for the lot currently on screen, so a photo shot on
+  a lot never revisited while online stayed device-local indefinitely, and
+  "Reset local cache" deleted it despite the Settings copy saying only
+  unsent edits were affected. Added `drainPendingPhotos(profileId)`,
+  exported from `Photos.tsx`, which walks every pending blob regardless of
+  lot; `App.tsx` calls it once on mount and again on every `online` event.
+  The reset copy in `App.tsx` now says photos are discarded too.
+
+- **Task 12 (`sync.ts`, reconnect backfill)** — `pullAll()` ran once at boot
+  and the realtime subscription was otherwise the only inbound path, so a
+  dropped websocket (phone lock, cell handover, laptop sleep) left the
+  viewer screen stale with no indication. Added a debounced backfill in
+  `startSync` triggered by `online` and by `document.visibilitychange`
+  turning visible, reusing `pullAll` + the same `isDirty` guard as the
+  realtime handler so an unsynced local edit is never overwritten.
+
+- **Comments (`Comments.tsx`)** — an insert failure was silently swallowed;
+  the design doc's "queue in the same outbox when offline" claim was never
+  implemented for comments. Rather than build full outbox queuing (a larger
+  change), `post()` now keeps the drafted text in the composer on failure
+  and shows a `role="alert"` message telling the author it wasn't sent. The
+  design doc is corrected to describe this instead of outbox queuing.

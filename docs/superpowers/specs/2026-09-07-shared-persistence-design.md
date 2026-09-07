@@ -161,8 +161,14 @@ Inbound realtime changes are applied to any lot **not currently dirty in the
 local outbox**, so an edit in progress is never yanked out from under the
 inspector.
 
-Comments write straight through when online (no merge problem, low value when
-stale) but queue in the same outbox when offline.
+Comments write straight through (no merge problem, low value when stale) and
+are **not** queued in the outbox. If the insert fails - offline or otherwise -
+the composer keeps the drafted text and shows an alert-role message telling
+the author it was not sent and their text is kept; nothing is retried
+automatically. Full outbox queuing for comments (durable across reloads,
+automatic retry) is more spec-faithful but a larger change than the
+pre-deployment fix window allowed; this is the minimum that is honest about
+what actually happened to the comment.
 
 ## Access and permissions
 
