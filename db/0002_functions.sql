@@ -41,10 +41,8 @@ begin
   -- Rate limit: 10 attempts per 15 minutes per anonymous identity.
   insert into ehs.code_attempts (uid, attempts, first_at)
     values (v_uid, 0, now())
-  on conflict (uid) do nothing;
-
-  select attempts, first_at into v_tries, v_since
-    from ehs.code_attempts where uid = v_uid for update;
+  on conflict (uid) do update set uid = excluded.uid
+  returning attempts, first_at into v_tries, v_since;
 
   if v_since < now() - interval '15 minutes' then
     update ehs.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
@@ -71,7 +69,6 @@ begin
     set display_name = excluded.display_name,
         role         = excluded.role;
 
-  update ehs.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
   return v_role;
 end;
 $$;
@@ -93,12 +90,12 @@ begin
   if p_role not in ('admin','inspector','viewer') then
     raise exception 'unknown role %', p_role;
   end if;
-  if length(p_code) < 6 then
-    raise exception 'code must be at least 6 characters';
+  if length(coalesce(p_code, '')) < 12 then
+    raise exception 'code must be at least 12 characters';
   end if;
 
   insert into ehs.access_codes (role, code_hash, updated_at)
-    values (p_role, crypt(p_code, gen_salt('bf')), now())
+    values (p_role, crypt(p_code, gen_salt('bf', 12)), now())
   on conflict (role) do update
     set code_hash = excluded.code_hash, updated_at = now();
 end;
@@ -119,11 +116,15 @@ security invoker          -- runs as the caller, so RLS on machine_states applie
 set search_path = ehs, public
 as $$
 declare
-  v_applied boolean := false;
+  v_rows int := 0;
 begin
   if p_group not in ('inspection','commercial','decision') then
     raise exception 'unknown field group %', p_group;
   end if;
+
+  -- Clamp to guard against a skewed or hostile client clock. An unbounded
+  -- future timestamp would freeze this field group forever.
+  p_client_updated_at := least(p_client_updated_at, now() + interval '5 minutes');
 
   insert into ehs.machine_states (lot) values (p_lot)
   on conflict (lot) do nothing;
@@ -146,8 +147,8 @@ begin
      where lot = p_lot and decision_updated_at < p_client_updated_at;
   end if;
 
-  get diagnostics v_applied = row_count;
-  return v_applied;
+  get diagnostics v_rows = row_count;
+  return v_rows > 0;
 end;
 $$;
 
