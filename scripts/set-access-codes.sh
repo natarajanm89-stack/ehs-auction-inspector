@@ -22,7 +22,12 @@ for v in EHS_ADMIN_CODE EHS_INSPECTOR_CODE EHS_VIEWER_CODE; do
 done
 
 for v in EHS_ADMIN_CODE EHS_INSPECTOR_CODE EHS_VIEWER_CODE; do
+  # Trim surrounding whitespace. The gate trims what the user types, so a stray
+  # space in .env would hash a code nobody can ever enter.
   val="${!v}"
+  val="${val#"${val%%[![:space:]]*}"}"
+  val="${val%"${val##*[![:space:]]}"}"
+  printf -v "$v" '%s' "$val"
   if [ ${#val} -lt 12 ]; then
     echo "ERROR: $v is ${#val} characters; minimum is 12." >&2; exit 1
   fi
