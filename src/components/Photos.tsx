@@ -174,6 +174,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
         }
         const id = `${lot}/${crypto.randomUUID()}.jpg`
         await putPhotoBlob(id, blob)        // survives a crash or signal loss
+        window.dispatchEvent(new CustomEvent('ehs-photo-added'))
         await load()                        // show it immediately
         if (!single && navigator.onLine) {
           const ok = await upload(id, blob)
