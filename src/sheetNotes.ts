@@ -96,4 +96,17 @@ export const SHEETS: Sheet[] = [
       { lot: 676, model: 'E600JP', year: 2010 },
     ],
   },
+  {
+    id: 'sheet-6', label: 'Sheet 6', subtitle: 'Genie telescopic and articulating booms',
+    image: 'sheet-6.jpg', source: '20260908_024659.jpg',
+    entries: [
+      { lot: 662, model: 'Z-80/60', year: 2009 },
+      { lot: 678, model: 'Z60/34', year: 2010 },
+      { lot: 655, model: 'Z135', year: 2010 },
+      { lot: 700, model: 'Z62-40', year: 2016 },
+      { lot: 627, model: 'S85', year: 2014 },
+      { lot: 661, model: 'Z-80/60', year: 2011 },
+      { lot: 638, model: 'S-65', year: 2014 },
+    ],
+  },
 ]
