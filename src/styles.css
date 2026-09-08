@@ -130,7 +130,7 @@ p { color:#5f6c7e; line-height:1.6; }
 .card-bottom strong { font-size:13px; margin-top:2px; }
 .card-actions { display:flex; gap:8px; margin-top:12px; }
 .card-actions > * { flex:1; }
-.filterbar { display:grid; grid-template-columns:1fr 260px 150px; gap:10px; margin:18px 0; background:#fff; border:1px solid var(--line); border-radius:14px; padding:10px; position:sticky; top:120px; z-index:12; box-shadow:0 8px 24px rgba(20,35,55,.05); }
+.filterbar { display:grid; grid-template-columns:1fr 190px 170px 130px; gap:10px; margin:18px 0; background:#fff; border:1px solid var(--line); border-radius:14px; padding:10px; position:sticky; top:120px; z-index:12; box-shadow:0 8px 24px rgba(20,35,55,.05); }
 input, select, textarea { width:100%; border:1px solid #ced7e3; background:white; color:var(--ink); border-radius:9px; padding:10px 11px; outline:none; }
 input:focus, select:focus, textarea:focus { border-color:#6a91f5; box-shadow:0 0 0 3px rgba(45,100,241,.1); }
 code { background:#e9eef6; border-radius:5px; padding:2px 5px; }
@@ -324,3 +324,9 @@ td select { min-width:110px; padding:7px; }
 .pill-match { background: #e7f6ec; color: #1a7f43; }
 .pill-model, .pill-year { background: #fff1d6; color: #8a5a00; }
 .pill-absent { background: #fdecea; color: #b42318; }
+
+
+/* The machine hero uses a fixed-height image; give the no-photo tile the same
+   presence so the layout does not jump between lots that have one and lots
+   that do not. */
+.machine-hero > .machine-image-fallback { min-height: 240px; }
