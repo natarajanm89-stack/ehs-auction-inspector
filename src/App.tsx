@@ -14,10 +14,22 @@ import { SheetVerification } from './components/SheetVerification'
 import { Photos, drainPendingPhotos } from './components/Photos'
 import { Comments, useUnreadCounts } from './components/Comments'
 import { getMode, setMode, isCollaborativeAvailable, getLocalName, setLocalName } from './lib/mode'
+import { requestPersistentStorage, isStoragePersisted, storageEstimate, type StorageEstimateResult } from './lib/persistence'
+import { onBackupError, getLastExport, setLastExport, getLastChange, hasUnexportedWork, readBackup } from './lib/backup'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'sheets' | 'settings'
 
-const euro = (n: number) => new Intl.NumberFormat('en-NL', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0)
+function minutesAgo(iso: string): string {
+  const mins = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 60000))
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins} min ago`
+  const hrs = Math.round(mins / 60)
+  if (hrs < 24) return `${hrs} hr${hrs === 1 ? '' : 's'} ago`
+  const days = Math.round(hrs / 24)
+  return `${days} day${days === 1 ? '' : 's'} ago`
+}
+
+const euro = (n: number) =>new Intl.NumberFormat('en-NL', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0)
 const inr = (n: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n || 0)
 
 function Badge({ children, tone = 'neutral' }: { children: React.ReactNode, tone?: string }) {
@@ -30,7 +42,7 @@ function ScoreBar({ value }: { value: number }) {
 
 function App({ profile }: { profile: Profile }) {
   const canWrite = can(profile.role, 'write_state')
-  const { states, ready, patchState } = useAllMachineStates(canWrite)
+  const { states, ready, patchState, recoveredCount } = useAllMachineStates(canWrite)
   const unread = useUnreadCounts(profile.id)
   const [tab, setTab] = useState<Tab>('dashboard')
   const [selectedLot, setSelectedLot] = useState<number>(machines[0].lot)
@@ -41,11 +53,33 @@ function App({ profile }: { profile: Profile }) {
   const [detailLot, setDetailLot] = useState<number | null>(null)
   const [storageError, setStorageError] = useState('')
   const [legacyCount, setLegacyCount] = useState(() => Object.keys(readLegacyState() ?? {}).length)
+  const [lastExport, setLastExportState] = useState<string | null>(() => getLastExport())
+  const [estimate, setEstimate] = useState<StorageEstimateResult | null>(null)
+  const [showFullBanner, setShowFullBanner] = useState(true)
+  const [exportedThisSession, setExportedThisSession] = useState(false)
 
   useEffect(() => onStorageError(setStorageError), [])
+  useEffect(() => onBackupError(setStorageError), [])
   // A transient storage failure shouldn't leave the banner stuck for the
   // whole session - clear it once sync subsequently reports healthy.
   useEffect(() => subscribeStatus(s => { if (s.status === 'synced') setStorageError('') }), [])
+
+  // Ask the browser to exempt this origin from automatic storage eviction.
+  // Best-effort: most engines only grant it for an installed/engaged app.
+  useEffect(() => { void requestPersistentStorage() }, [])
+
+  const refreshEstimate = () => { void storageEstimate().then(e => { if (e) setEstimate(e) }) }
+  useEffect(() => {
+    refreshEstimate()
+    window.addEventListener('ehs-photo-added', refreshEstimate)
+    return () => window.removeEventListener('ehs-photo-added', refreshEstimate)
+  }, [])
+
+  useEffect(() => {
+    if (recoveredCount > 0) {
+      setStorageError(`Recovered ${recoveredCount} lot${recoveredCount > 1 ? 's' : ''} from the on-device backup.`)
+    }
+  }, [recoveredCount])
 
   // Drain every pending photo on this device, not just the lot on screen -
   // an inspector may shoot a lot and never revisit it while online.
@@ -74,10 +108,21 @@ function App({ profile }: { profile: Profile }) {
 
   const navigateMachine = (lot: number, nextTab: Tab = 'inspect') => { setSelectedLot(lot); setTab(nextTab); window.scrollTo({ top: 0, behavior: 'smooth' }) }
 
+  const lotsWithData = machines.filter(m => Object.values(states[m.lot]?.inspection.scores || {}).some(v => v > 0) || states[m.lot]?.inspection.notes).length
+  const lastChange = getLastChange()
+  const unexported = hasUnexportedWork(lastChange, lastExport)
+  const exportAgo = lastExport ? minutesAgo(lastExport) : null
+  const nearlyFull = !!estimate && estimate.percent >= 80
+  const lastBackup = readBackup()?.savedAt ?? null
+
   const exportData = () => {
-    const payload = { exportedAt: new Date().toISOString(), event: EVENT, machines, states }
+    const now = new Date().toISOString()
+    const payload = { exportedAt: now, event: EVENT, machines, states }
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
     const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = `ehs-auction-inspection-${new Date().toISOString().slice(0,10)}.json`; a.click(); URL.revokeObjectURL(a.href)
+    setLastExport(now)
+    setLastExportState(now)
+    setExportedThisSession(true)
   }
 
   const exportCsv = () => {
@@ -104,13 +149,22 @@ function App({ profile }: { profile: Profile }) {
         <span className="who" title="Your identity on this device">
           {profile.display_name} · {profile.role}
         </span>
-        <button className="ghost" onClick={exportData}>Export</button>
+        <span className={`export-badge ${unexported ? 'urgent' : 'ok'}`} title="Export is the only way your work leaves this device">
+          {lastExport ? `Exported ${exportAgo}` : 'Never exported'}
+        </span>
+        <button className={unexported ? 'primary' : 'ghost'} onClick={exportData}>Export</button>
       </div>
     </header>
     {storageError && (
       <div className="storage-error-banner" role="alert">
         <span>{storageError}</span>
         <button className="ghost small" onClick={() => setStorageError('')}>Dismiss</button>
+      </div>
+    )}
+    {nearlyFull && showFullBanner && estimate && (
+      <div className="storage-error-banner" role="alert">
+        <span>Storage is nearly full ({Math.round(estimate.usedMb)} MB of {Math.round(estimate.quotaMb)} MB). Export your session and remove photos you no longer need.</span>
+        <button className="ghost small" onClick={() => setShowFullBanner(false)}>Dismiss</button>
       </div>
     )}
 
@@ -250,7 +304,8 @@ function App({ profile }: { profile: Profile }) {
 
       {tab === 'settings' && <section className="page narrow">
         <span className="eyebrow">OPERATING NOTES</span><h1>Settings & governance</h1>
-        <ModePanel />
+        <DataSafetyPanel lotsWithData={lotsWithData} lastExport={lastExport} lastBackup={lastBackup} estimate={estimate} />
+        <ModePanel unexported={unexported} />
         {getMode() === 'single'
           ? <div className="panel"><h3>Single device mode</h3><p>Scores, notes, bids and decisions are saved only to this device's storage. Nobody else on the team can see them from here — the way data leaves this device is <strong>Export</strong> (JSON) at the top of the screen, shared however you choose.</p></div>
           : <div className="panel"><h3>Shared live persistence</h3><p>Scores, notes, bids and decisions are saved to this device instantly and synced to the shared server in the background, so the whole team — on site or remote — sees the same data within seconds of a change. If you go offline, edits still save locally and upload automatically once you reconnect.</p></div>
@@ -258,8 +313,7 @@ function App({ profile }: { profile: Profile }) {
         <div className="panel"><h3>Commercial assumptions</h3><p>EUR→INR FX, freight, duty/import percentage, inland cost, repair reserve, contingency and target margin are editable per machine. The app does not claim these are tax advice or final customs values.</p></div>
         <div className="panel"><h3>Data provenance</h3><p>Starter lot facts come from the Ritchie Bros. Zevenbergen catalog/PDP pages checked on 7 Sep 2026. Auction catalog details can change. EHS inspection results are separate fields and should be treated as the controlling condition assessment.</p></div>
         <SignOut />
-        <div className="panel danger-panel"><h3>Reset this device</h3><p>Clears the local cache, any unsent edits, and any photos not yet uploaded on this device. Data already
-           synced to the server is not affected.</p><button className="danger-button" onClick={async ()=>{if(confirm('Clear local cache, unsent edits, and unsent photos on this device?')){await clearAll(); location.reload()}}}>Reset local cache</button></div>
+        <ResetPanel lotsWithData={lotsWithData} unexported={unexported} exportedThisSession={exportedThisSession} onExport={exportData} />
       </section>}
     </main>
 
@@ -300,7 +354,71 @@ function MachineModal({ machine, state, close, inspect }: { machine: Machine, st
   return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" onClick={close}>×</button><MachineImage machine={machine} className="modal-image"/><div className="modal-content"><div className="badges"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><Badge>{machine.category}</Badge><Badge>{machine.power}</Badge></div><h2>Lot {machine.lot} · {machine.make} {machine.model}</h2><p>{machine.title}</p><div className="detail-grid"><span>Year<strong>{machine.year}</strong></span><span>Hours<strong>{machine.hours?.toLocaleString()}</strong></span><span>Serial<strong>{machine.serial || 'Verify on site'}</strong></span><span>EHS fit<strong>{c.commercialFit}%</strong></span></div><h3>Catalog features</h3><ul>{machine.features.map(x=><li key={x}>{x}</li>)}</ul>{machine.notes && <div className="catalog-note"><strong>Catalog note</strong><p>{machine.notes}</p></div>}<p className="muted">Catalog fields are source-verified starter data, not an EHS condition guarantee. Verify serial, hours, CE, functions and defects during inspection.</p><div className="hero-actions"><button className="primary" onClick={inspect}>Start inspection</button><a className="button-link" href={machine.sourceUrl} target="_blank">Open source ↗</a></div></div></div></div>
 }
 
-function ModePanel() {
+function ResetPanel({ lotsWithData, unexported, exportedThisSession, onExport }: {
+  lotsWithData: number, unexported: boolean, exportedThisSession: boolean, onExport: () => void,
+}) {
+  const [confirmText, setConfirmText] = useState('')
+  const mustExportFirst = unexported && !exportedThisSession
+  const lastExport = getLastExport()
+
+  return (
+    <div className="panel danger-panel">
+      <h3>Reset this device</h3>
+      <p>{lotsWithData} lot{lotsWithData === 1 ? '' : 's'} on this device hold inspection data.
+        {' '}{lastExport ? `Last exported ${minutesAgo(lastExport)}.` : 'Nothing has been exported yet.'}</p>
+      <p>Clears the local cache, any unsent edits, and any photos not yet uploaded on this device. Data already
+         synced to the server is not affected. This cannot be undone.</p>
+      {mustExportFirst && (
+        <p className="muted"><strong>Export your session first</strong> - there is unexported work that only exists on this device.</p>
+      )}
+      {!mustExportFirst && (
+        <label>Type DELETE to enable the reset button
+          <input value={confirmText} onChange={e => setConfirmText(e.target.value)} placeholder="DELETE" />
+        </label>
+      )}
+      <button
+        className="danger-button"
+        disabled={mustExportFirst ? false : confirmText !== 'DELETE'}
+        onClick={async () => {
+          if (mustExportFirst) { onExport(); return }
+          if (confirm('Clear local cache, unsent edits, and unsent photos on this device? This cannot be undone.')) {
+            await clearAll(); location.reload()
+          }
+        }}
+      >
+        {mustExportFirst ? 'Export first, then reset' : 'Reset local cache'}
+      </button>
+    </div>
+  )
+}
+
+function DataSafetyPanel({ lotsWithData, lastExport, lastBackup, estimate }: {
+  lotsWithData: number, lastExport: string | null, lastBackup: string | null, estimate: StorageEstimateResult | null,
+}) {
+  const [persisted, setPersisted] = useState<boolean | null>(null)
+  useEffect(() => { void isStoragePersisted().then(setPersisted) }, [])
+
+  return (
+    <div className="panel">
+      <h3>Data safety</h3>
+      <p className="muted">In plain terms: everything you enter is saved on this phone only. It is not shared with anyone
+        and is not stored on any server unless you are in collaborative mode. Nobody can see it, and nobody else can lose it for you -
+        which also means only this device can lose it.</p>
+      <div className="detail-grid">
+        <span>Protection<strong>{persisted === null ? 'Checking…' : persisted ? 'Protected from automatic cleanup' : 'Not protected'}</strong></span>
+        <span>Storage used<strong>{estimate ? `${Math.round(estimate.usedMb)} of ${Math.round(estimate.quotaMb)} MB` : 'Unknown'}</strong></span>
+        <span>Lots with data<strong>{lotsWithData}</strong></span>
+        <span>Last export<strong>{lastExport ? minutesAgo(lastExport) : 'Never'}</strong></span>
+        <span>Last backup<strong>{lastBackup ? minutesAgo(lastBackup) : 'Never'}</strong></span>
+      </div>
+      {persisted === false && (
+        <p className="muted">Not protected — add this app to your home screen to reduce the chance your browser clears it automatically.</p>
+      )}
+    </div>
+  )
+}
+
+function ModePanel({ unexported = false }: { unexported?: boolean }) {
   const [mode] = useState(getMode())
   const [name, setName] = useState(getLocalName())
   const [sync, setSync] = useState({ pending: 0 })
@@ -317,7 +435,9 @@ function ModePanel() {
           <input value={name} maxLength={60} onChange={e => { setName(e.target.value); setLocalName(e.target.value) }} />
         </label>
         {!available && <p className="muted">This build has no server configured, so collaborative mode is unavailable.</p>}
+        {unexported && <p className="muted" role="status">You have unexported work on this device. Export it before switching modes, just in case.</p>}
         <button className="ghost" disabled={!available} onClick={() => {
+          if (unexported && !confirm('You have unexported work on this device. Switch to collaborative mode anyway? Nothing is deleted, but export a backup first if you can.')) return
           setMode('collaborative')
           location.reload()
         }}>Enable collaborative mode</button>
