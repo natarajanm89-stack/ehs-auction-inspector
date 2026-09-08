@@ -6,6 +6,7 @@ import { enqueue, getAllStates, isDirty, putState } from '../lib/db'
 import { drainOutbox, pullAll, refreshPending, startSync } from '../lib/sync'
 import type { FieldGroup } from '../lib/db'
 import { getMode } from '../lib/mode'
+import { readBackup, writeBackup, setLastChange } from '../lib/backup'
 
 const GROUPS: FieldGroup[] = ['inspection', 'commercial', 'decision']
 
@@ -18,8 +19,12 @@ function seed(partial: Record<number, MachineState>): Record<number, MachineStat
 export function useAllMachineStates(canWrite: boolean) {
   const [states, setStates] = useState<Record<number, MachineState>>(() => seed({}))
   const [ready, setReady] = useState(false)
+  // Set on boot when IndexedDB came back empty but a localStorage backup
+  // restored the session - surfaced in the UI as a recovery notice.
+  const [recoveredCount, setRecoveredCount] = useState(0)
   const statesRef = useRef(states)
   useEffect(() => { statesRef.current = states }, [states])
+  const backupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   // Lots edited in this session - the boot pull must never overwrite one of
   // these regardless of what the outbox says at any given instant, since an
   // edit made between the isDirty check and the putState below would
@@ -37,7 +42,21 @@ export function useAllMachineStates(canWrite: boolean) {
   useEffect(() => {
     let cancelled = false
     ;(async () => {
-      const local = await getAllStates()
+      let local = await getAllStates()
+      // IndexedDB came back empty - the browser may have evicted it (iOS
+      // Safari clears unvisited-site storage after ~7 days, or storage
+      // pressure evicted it). If a localStorage backup survived, restore
+      // from it rather than presenting an inspector with a blank slate.
+      if (Object.keys(local).length === 0) {
+        const backup = readBackup()
+        if (backup && Object.keys(backup.states).length > 0) {
+          local = backup.states
+          for (const [lotKey, s] of Object.entries(backup.states)) {
+            await putState(Number(lotKey), { ...blankState(), ...s })
+          }
+          if (!cancelled) setRecoveredCount(Object.keys(backup.states).length)
+        }
+      }
       if (!cancelled) { setStates(seed(local)); setReady(true) }
       if (getMode() === 'single') return   // no network at all in single mode
       try {
@@ -97,6 +116,15 @@ export function useAllMachineStates(canWrite: boolean) {
     draftRef.current[lot] = next
 
     setStates(prev => ({ ...prev, [lot]: next }))
+    setLastChange(updatedAt)
+
+    // Debounced independent backup: a second copy of the data, in a
+    // different storage mechanism than IndexedDB, so a change does not
+    // thrash localStorage on every keystroke.
+    if (backupTimerRef.current) clearTimeout(backupTimerRef.current)
+    backupTimerRef.current = setTimeout(() => {
+      writeBackup({ ...statesRef.current, [lot]: draftRef.current[lot] ?? next })
+    }, 3000)
 
     const payload =
       group === 'inspection' ? next.inspection :
@@ -115,5 +143,5 @@ export function useAllMachineStates(canWrite: boolean) {
       .catch(() => {})
   }, [canWrite])
 
-  return { states, ready, patchState }
+  return { states, ready, patchState, recoveredCount }
 }
