@@ -1,4 +1,4 @@
-export type MachineCategory = 'Articulating Boom Lift' | 'Scissor Lift' | 'Vertical Mast Lift' | 'Telehandler'
+export type MachineCategory = 'Articulating Boom Lift' | 'Telescopic Boom Lift' | 'Scissor Lift' | 'Vertical Mast Lift' | 'Telehandler'
 export type PowerType = 'Diesel' | 'Electric' | 'Unknown'
 export type Priority = 'P1' | 'P2' | 'P3'
 export type Decision = 'UNASSESSED' | 'BUY' | 'BUY_IF' | 'HOLD' | 'REJECT'
