@@ -10,10 +10,11 @@ import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
 import { SignOut } from './components/SignOut'
 import { MachineImage } from './components/MachineImage'
+import { SheetVerification } from './components/SheetVerification'
 import { Photos, drainPendingPhotos } from './components/Photos'
 import { Comments, useUnreadCounts } from './components/Comments'
 
-type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'settings'
+type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'sheets' | 'settings'
 
 const euro = (n: number) => new Intl.NumberFormat('en-NL', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(n || 0)
 const inr = (n: number) => new Intl.NumberFormat('en-IN', { style: 'currency', currency: 'INR', maximumFractionDigits: 0 }).format(n || 0)
@@ -113,7 +114,7 @@ function App({ profile }: { profile: Profile }) {
     )}
 
     <nav className="nav-tabs">
-      {([['dashboard','Overview'],['machines','Machines'],['inspect','Inspect'],['bidboard','Bid Board'],['settings','Settings']] as [Tab,string][]).map(([key,label]) =>
+      {([['dashboard','Overview'],['machines','Machines'],['inspect','Inspect'],['bidboard','Bid Board'],['sheets','Lot sheets'],['settings','Settings']] as [Tab,string][]).map(([key,label]) =>
         <button key={key} className={tab===key?'active':''} onClick={()=>setTab(key)}>{label}</button>
       )}
     </nav>
@@ -243,6 +244,8 @@ function App({ profile }: { profile: Profile }) {
         <div className="table-wrap"><table><thead><tr><th>Lot</th><th>Machine</th><th>Inspection</th><th>Decision</th><th>Current bid</th><th>Stop-bid</th><th>Headroom</th><th>Status</th><th></th></tr></thead><tbody>{machines.filter(m=>states[m.lot]?.shortlist || Object.values(states[m.lot]?.inspection.scores||{}).some(v=>v>0)).map(m=>{const s=states[m.lot]; const c=calc(m,s); const d=autoDecision(m,s); const head=c.effectiveMaxBid-s.commercial.currentBidEur; return <tr key={m.lot}><td><strong>{m.lot}</strong></td><td><strong>{m.make} {m.model}</strong><small>{m.year} · {m.hours?.toLocaleString()} h</small></td><td><span className="score-number">{c.technical}%</span></td><td><Badge tone={d==='BUY'?'good':d==='BUY_IF'?'warn':d==='REJECT'?'danger':'neutral'}>{decisionLabel(d)}</Badge></td><td>{euro(s.commercial.currentBidEur)}</td><td><strong>{euro(c.effectiveMaxBid)}</strong></td><td className={head<0?'negative':'positive'}>{euro(head)}</td><td><select disabled={!canWrite} value={s.commercial.status} onChange={e=>patchState(m.lot,'commercial',x=>({...x,commercial:{...x.commercial,status:e.target.value as any}}))}><option>WATCH</option><option>READY</option><option>BIDDING</option><option>STOPPED</option><option>WON</option><option>LOST</option></select></td><td><button className="ghost small" onClick={()=>navigateMachine(m.lot)}>Open</button></td></tr>})}</tbody></table></div>
         {machines.filter(m=>states[m.lot]?.shortlist).length===0 && <div className="empty">No machines are shortlisted yet. Inspect a machine and send it to the bid board.</div>}
       </section>}
+
+      {tab === 'sheets' && <SheetVerification/>}
 
       {tab === 'settings' && <section className="page narrow">
         <span className="eyebrow">OPERATING NOTES</span><h1>Settings & governance</h1>
