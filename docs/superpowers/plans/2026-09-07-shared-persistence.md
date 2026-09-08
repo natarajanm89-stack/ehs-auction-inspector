@@ -19,17 +19,28 @@
 - `calc()` and `autoDecision()` must remain behaviourally identical. Any change to their output is a regression.
 - Existing TypeScript types in `src/types.ts` stay as-is, with one exception: `InspectionState.photos` is removed (photos move to their own table).
 - Conflict resolution is **last-write-wins per field group** (`inspection`, `commercial`, `decision`) using client-supplied timestamps.
-- Supabase region: **eu-central-1 (Frankfurt)**. If the existing project is in another region, record the actual region here and proceed — do not recreate the project.
+- **All application objects live in the `ehs` schema, never `public`.** The target
+  project (`zxfyfigmajlvgbddlbbx`, "VanithaHomeKitchen") already hosts an unrelated
+  app in `public`; nothing in this plan may create, alter or drop anything there.
+- The Supabase JS client must be constructed with `db: { schema: 'ehs' }`, and `ehs`
+  must be listed under **Settings → API → Data API → Exposed schemas** or every
+  request 404s.
+- Supabase region: **eu-central-2 (Zurich)**, fixed. Shared with the existing app.
+- **Never run `supabase db push`, `db reset` or `db pull`.** The remote project holds
+  21 migrations owned by another application. All SQL here is applied with
+  `psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f <file>`, and our SQL lives in `db/`,
+  outside `supabase/migrations/`, so the CLI never touches it.
 - Commit after every task. Conventional-commit prefixes (`feat:`, `test:`, `chore:`, `refactor:`).
 
 ## File Structure
 
 | File | Responsibility |
 |---|---|
-| `supabase/migrations/0001_schema.sql` | Tables, indexes, enum-ish constraints |
-| `supabase/migrations/0002_functions.sql` | `redeem_access_code`, `sync_machine_state`, role helper |
-| `supabase/migrations/0003_rls.sql` | RLS policies for every table + storage bucket |
-| `supabase/seed_machines.sql` | Generated one-time catalog seed from `src/data.ts` |
+| `db/0001_schema.sql` | Tables, indexes, enum-ish constraints |
+| `db/0002_functions.sql` | `redeem_access_code`, `sync_machine_state`, role helper |
+| `db/0003_rls.sql` | RLS policies for every table + storage bucket |
+| `db/seed_machines.sql` | Generated one-time catalog seed from `src/data.ts` |
+| `src/lib/keyGuard.ts` | Pure, testable service_role key guard |
 | `src/lib/supabase.ts` | Client construction + anonymous session bootstrap |
 | `src/lib/profile.ts` | Profile fetch, role type, `redeemCode()` wrapper |
 | `src/lib/db.ts` | IndexedDB: state cache, photo blobs, outbox queue |
@@ -379,36 +390,47 @@ git commit -m "refactor: extract calc.ts with regression tests"
 ### Task 3: Database schema
 
 **Files:**
-- Create: `supabase/migrations/0001_schema.sql`, `scripts/gen-seed.mjs`, `supabase/seed_machines.sql`
+- Create: `db/0001_schema.sql`, `scripts/gen-seed.mjs`, `db/seed_machines.sql`
 
 **Interfaces:**
 - Consumes: `src/data.ts` (`machines` array) as the seed source
 - Produces: tables `profiles`, `access_codes`, `machines`, `machine_states`, `photos`, `comments`, `comment_reads`
 
-- [ ] **Step 1: Initialise the Supabase CLI project**
+- [ ] **Step 1: Confirm the CLI is already initialised and linked**
+
+The controller has already run `supabase init` and `supabase link --project-ref
+zxfyfigmajlvgbddlbbx`. Verify, do not repeat:
 
 ```bash
-npx supabase init
+test -f supabase/config.toml && echo linked-ok
 ```
 
-Expected: creates `supabase/config.toml`. Answer "n" to generating VS Code settings.
+- [ ] **Step 2: Confirm psql can reach the database**
 
-- [ ] **Step 2: Link to your existing project**
+**Do not use `supabase db push`.** The remote project carries 21 migrations
+belonging to an unrelated application; pushing would try to reconcile our work
+with that history. All SQL in this plan is applied directly with `psql`, which
+leaves the other app's migration history untouched.
 
 ```bash
-npx supabase login
-npx supabase link --project-ref <YOUR-PROJECT-REF>
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "select current_database(), current_user;"
 ```
 
-The project ref is the subdomain of your `VITE_SUPABASE_URL` (`https://<ref>.supabase.co`).
+Expected: one row. If `psql` is not on PATH, use
+`/opt/homebrew/opt/libpq/bin/psql`.
 
-- [ ] **Step 3: Write `supabase/migrations/0001_schema.sql`**
+- [ ] **Step 3: Write `db/0001_schema.sql`**
 
 ```sql
 create extension if not exists pgcrypto;
 
+-- Everything for this app lives here. The project's public schema belongs to an
+-- unrelated application and must not be touched.
+create schema if not exists ehs;
+grant usage on schema ehs to authenticated, anon;
+
 -- Identity. One row per device that has redeemed a code.
-create table public.profiles (
+create table ehs.profiles (
   id            uuid primary key references auth.users(id) on delete cascade,
   display_name  text not null check (length(trim(display_name)) between 1 and 60),
   role          text not null check (role in ('admin','inspector','viewer')),
@@ -416,21 +438,21 @@ create table public.profiles (
 );
 
 -- Hashed access codes, one per role. Never readable by any client.
-create table public.access_codes (
+create table ehs.access_codes (
   role        text primary key check (role in ('admin','inspector','viewer')),
   code_hash   text not null,
   updated_at  timestamptz not null default now()
 );
 
 -- Rate limiting for code redemption, keyed by anonymous auth uid.
-create table public.code_attempts (
+create table ehs.code_attempts (
   uid          uuid primary key,
   attempts     int not null default 0,
   first_at     timestamptz not null default now()
 );
 
 -- Catalog. Mirrors the Machine type in src/types.ts.
-create table public.machines (
+create table ehs.machines (
   lot             int primary key,
   year            int,
   make            text not null,
@@ -453,8 +475,8 @@ create table public.machines (
 );
 
 -- Per-lot state, three independently versioned field groups.
-create table public.machine_states (
-  lot                     int primary key references public.machines(lot) on delete cascade,
+create table ehs.machine_states (
+  lot                     int primary key references ehs.machines(lot) on delete cascade,
   inspection              jsonb not null default '{}'::jsonb,
   inspection_updated_at   timestamptz not null default 'epoch',
   commercial              jsonb not null default '{}'::jsonb,
@@ -464,43 +486,47 @@ create table public.machine_states (
   decision_updated_at     timestamptz not null default 'epoch'
 );
 
-create table public.photos (
+create table ehs.photos (
   id            uuid primary key default gen_random_uuid(),
-  lot           int not null references public.machines(lot) on delete cascade,
+  lot           int not null references ehs.machines(lot) on delete cascade,
   storage_path  text not null unique,
   caption       text,
-  taken_by      uuid references public.profiles(id) on delete set null,
+  taken_by      uuid references ehs.profiles(id) on delete set null,
   created_at    timestamptz not null default now()
 );
-create index photos_lot_idx on public.photos (lot, created_at desc);
+create index photos_lot_idx on ehs.photos (lot, created_at desc);
 
-create table public.comments (
+create table ehs.comments (
   id           uuid primary key default gen_random_uuid(),
-  lot          int not null references public.machines(lot) on delete cascade,
-  author_id    uuid references public.profiles(id) on delete set null,
+  lot          int not null references ehs.machines(lot) on delete cascade,
+  author_id    uuid references ehs.profiles(id) on delete set null,
   author_name  text not null,
   body         text not null check (length(trim(body)) between 1 and 4000),
   created_at   timestamptz not null default now(),
   edited_at    timestamptz
 );
-create index comments_lot_idx on public.comments (lot, created_at);
+create index comments_lot_idx on ehs.comments (lot, created_at);
 
-create table public.comment_reads (
-  profile_id    uuid not null references public.profiles(id) on delete cascade,
-  lot           int not null references public.machines(lot) on delete cascade,
+create table ehs.comment_reads (
+  profile_id    uuid not null references ehs.profiles(id) on delete cascade,
+  lot           int not null references ehs.machines(lot) on delete cascade,
   last_read_at  timestamptz not null default now(),
   primary key (profile_id, lot)
 );
 
+-- PostgREST needs table privileges as well as RLS policies; RLS then narrows
+-- what these grants allow.
+grant select, insert, update, delete on all tables in schema ehs to authenticated;
+
 -- Deny-by-default. Policies arrive in 0003.
-alter table public.profiles       enable row level security;
-alter table public.access_codes   enable row level security;
-alter table public.code_attempts  enable row level security;
-alter table public.machines       enable row level security;
-alter table public.machine_states enable row level security;
-alter table public.photos         enable row level security;
-alter table public.comments       enable row level security;
-alter table public.comment_reads  enable row level security;
+alter table ehs.profiles       enable row level security;
+alter table ehs.access_codes   enable row level security;
+alter table ehs.code_attempts  enable row level security;
+alter table ehs.machines       enable row level security;
+alter table ehs.machine_states enable row level security;
+alter table ehs.photos         enable row level security;
+alter table ehs.comments       enable row level security;
+alter table ehs.comment_reads  enable row level security;
 ```
 
 `inspection_updated_at` defaults to `'epoch'`, not `now()`. A row created by the seed must lose to any real client edit; defaulting to `now()` would make fresh empty rows beat genuine offline work.
@@ -525,7 +551,7 @@ const rows = machines.map(m => `(${[
 ].join(', ')})`).join(',\n  ')
 
 const sql = `-- Generated by scripts/gen-seed.mjs. Do not edit by hand.
-insert into public.machines (
+insert into ehs.machines (
   lot, year, make, model, title, category, power, hours, serial, location,
   image_url, source_url, features, notes, priority, fleet_fit, parts_support,
   rental_demand, source_verified
@@ -533,12 +559,12 @@ insert into public.machines (
   ${rows}
 on conflict (lot) do nothing;
 
-insert into public.machine_states (lot)
-select lot from public.machines
+insert into ehs.machine_states (lot)
+select lot from ehs.machines
 on conflict (lot) do nothing;
 `
 
-writeFileSync(new URL('../supabase/seed_machines.sql', import.meta.url), sql)
+writeFileSync(new URL('../db/seed_machines.sql', import.meta.url), sql)
 console.log(`wrote ${machines.length} machines`)
 ```
 
@@ -550,21 +576,24 @@ npx vite-node scripts/gen-seed.mjs
 
 (`vite-node` is already available via Vite; it resolves the `.ts` import that plain `node` cannot.)
 
-Expected: prints `wrote N machines`; `supabase/seed_machines.sql` exists.
+Expected: prints `wrote N machines`; `db/seed_machines.sql` exists.
 
-Verify the count matches the source: `grep -c '^  (' supabase/seed_machines.sql` should equal the number of entries in `src/data.ts`.
+Verify the count matches the source: `grep -c '^  (' db/seed_machines.sql` should equal the number of entries in `src/data.ts`.
 
 - [ ] **Step 6: Apply the schema and seed**
 
 ```bash
-npx supabase db push
-npx supabase db execute --file supabase/seed_machines.sql
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/0001_schema.sql
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/seed_machines.sql
 ```
+
+`ON_ERROR_STOP=1` matters: without it psql reports success after a failed
+statement, and you would seed into a half-built schema.
 
 - [ ] **Step 7: Verify the tables exist and are seeded**
 
 ```bash
-npx supabase db execute --command "select count(*) as machines from public.machines; select count(*) as states from public.machine_states;"
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "select count(*) as machines from ehs.machines; select count(*) as states from ehs.machine_states;"
 ```
 
 Expected: both counts equal the number of lots in `src/data.ts`.
@@ -583,17 +612,17 @@ git commit -m "feat: add supabase schema and catalog seed"
 Two functions carry the whole design: one is the only path to a role, the other is the only path to writing state.
 
 **Files:**
-- Create: `supabase/migrations/0002_functions.sql`
+- Create: `db/0002_functions.sql`
 
 **Interfaces:**
 - Consumes: tables from Task 3
 - Produces:
-  - `public.caller_role() returns text` — SECURITY DEFINER, reads caller's role
-  - `public.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, raises on failure
-  - `public.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
-  - `public.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
+  - `ehs.caller_role() returns text` — SECURITY DEFINER, reads caller's role
+  - `ehs.redeem_access_code(p_code text, p_display_name text) returns text` — returns the granted role, or `'invalid_code'` / `'rate_limited'` (raises only on `not authenticated` / bad name, before any writes)
+  - `ehs.sync_machine_state(p_lot int, p_group text, p_payload jsonb, p_client_updated_at timestamptz) returns boolean` — true if applied, false if the incoming write was stale
+  - `ehs.set_access_code(p_role text, p_code text) returns void` — admin-only rotation
 
-- [ ] **Step 1: Write `supabase/migrations/0002_functions.sql`**
+- [ ] **Step 1: Write `db/0002_functions.sql`**
 
 ```sql
 -- Reads the caller's role without triggering the profiles RLS policy.
@@ -601,25 +630,25 @@ Two functions carry the whole design: one is the only path to a role, the other 
 -- and a built-in Postgres function.
 -- SECURITY DEFINER is required: policies on profiles will themselves call
 -- this function, and a plain query would recurse infinitely.
-create or replace function public.caller_role()
+create or replace function ehs.caller_role()
 returns text
 language sql
 security definer
-set search_path = public
+set search_path = ehs, public, extensions
 stable
 as $$
-  select role from public.profiles where id = auth.uid();
+  select role from ehs.profiles where id = auth.uid();
 $$;
 
-revoke all on function public.caller_role() from public;
-grant execute on function public.caller_role() to authenticated;
+revoke all on function ehs.caller_role() from public;
+grant execute on function ehs.caller_role() to authenticated;
 
 -- Redeems a code and creates the caller's profile. The only way to get a role.
-create or replace function public.redeem_access_code(p_code text, p_display_name text)
+create or replace function ehs.redeem_access_code(p_code text, p_display_name text)
 returns text
 language plpgsql
 security definer
-set search_path = public
+set search_path = ehs, public, extensions
 as $$
 declare
   v_uid    uuid := auth.uid();
@@ -636,77 +665,77 @@ begin
     raise exception 'name must be between 1 and 60 characters';
   end if;
 
-  -- Rate limit: 10 attempts per 15 minutes per anonymous identity.
-  insert into public.code_attempts (uid, attempts, first_at)
+  -- Rate limit: 10 attempts per 15 minutes per identity. Only failed
+  -- attempts increment the counter (see below), and success never touches
+  -- it, so a legitimate inspector redeeming repeatedly is never locked out.
+  insert into ehs.code_attempts (uid, attempts, first_at)
     values (v_uid, 0, now())
-  on conflict (uid) do nothing;
-
-  select attempts, first_at into v_tries, v_since
-    from public.code_attempts where uid = v_uid for update;
+  on conflict (uid) do update set uid = excluded.uid
+  returning attempts, first_at into v_tries, v_since;
 
   if v_since < now() - interval '15 minutes' then
-    update public.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
+    update ehs.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
     v_tries := 0;
   end if;
 
   if v_tries >= 10 then
-    raise exception 'too many attempts, try again later';
+    return 'rate_limited';
   end if;
 
-  update public.code_attempts set attempts = attempts + 1 where uid = v_uid;
-
   select role into v_role
-    from public.access_codes
+    from ehs.access_codes
    where code_hash = crypt(p_code, code_hash);
 
   if v_role is null then
-    raise exception 'invalid access code';
+    update ehs.code_attempts set attempts = attempts + 1 where uid = v_uid;
+    -- Must return, not raise: raising here would abort the transaction and
+    -- roll back the increment above, defeating the rate limit entirely.
+    return 'invalid_code';
   end if;
 
-  insert into public.profiles (id, display_name, role)
+  insert into ehs.profiles (id, display_name, role)
     values (v_uid, v_name, v_role)
   on conflict (id) do update
     set display_name = excluded.display_name,
         role         = excluded.role;
 
-  update public.code_attempts set attempts = 0, first_at = now() where uid = v_uid;
   return v_role;
 end;
 $$;
 
-revoke all on function public.redeem_access_code(text, text) from public;
-grant execute on function public.redeem_access_code(text, text) to authenticated;
+revoke all on function ehs.redeem_access_code(text, text) from public;
+grant execute on function ehs.redeem_access_code(text, text) to authenticated;
 
 -- Admin-only code rotation. Stores only the hash.
-create or replace function public.set_access_code(p_role text, p_code text)
+create or replace function ehs.set_access_code(p_role text, p_code text)
 returns void
 language plpgsql
 security definer
-set search_path = public
+set search_path = ehs, public, extensions
 as $$
 begin
-  if public.caller_role() is distinct from 'admin' then
+  if ehs.caller_role() is distinct from 'admin' then
     raise exception 'admin role required';
   end if;
   if p_role not in ('admin','inspector','viewer') then
     raise exception 'unknown role %', p_role;
   end if;
-  if length(p_code) < 6 then
-    raise exception 'code must be at least 6 characters';
+  if length(coalesce(p_code, '')) < 12 then
+    raise exception 'code must be at least 12 characters';
   end if;
 
-  insert into public.access_codes (role, code_hash, updated_at)
-    values (p_role, crypt(p_code, gen_salt('bf')), now())
+  insert into ehs.access_codes (role, code_hash, updated_at)
+    values (p_role, crypt(p_code, gen_salt('bf', 12)), now())
   on conflict (role) do update
     set code_hash = excluded.code_hash, updated_at = now();
 end;
 $$;
 
-revoke all on function public.set_access_code(text, text) from public;
-grant execute on function public.set_access_code(text, text) to authenticated;
+revoke all on function ehs.set_access_code(text, text) from public;
+grant execute on function ehs.set_access_code(text, text) to authenticated;
 
 -- The only write path for machine state. Idempotent, per-field-group LWW.
-create or replace function public.sync_machine_state(
+create or replace function ehs.sync_machine_state(
   p_lot int,
   p_group text,
   p_payload jsonb,
@@ -714,43 +743,47 @@ create or replace function public.sync_machine_state(
 ) returns boolean
 language plpgsql
 security invoker          -- runs as the caller, so RLS on machine_states applies
-set search_path = public
+set search_path = ehs, public, extensions
 as $$
 declare
-  v_applied boolean := false;
+  v_rows int := 0;
 begin
   if p_group not in ('inspection','commercial','decision') then
     raise exception 'unknown field group %', p_group;
   end if;
 
-  insert into public.machine_states (lot) values (p_lot)
+  -- Clamp to guard against a skewed or hostile client clock. An unbounded
+  -- future timestamp would freeze this field group forever.
+  p_client_updated_at := least(p_client_updated_at, now() + interval '5 minutes');
+
+  insert into ehs.machine_states (lot) values (p_lot)
   on conflict (lot) do nothing;
 
   if p_group = 'inspection' then
-    update public.machine_states
+    update ehs.machine_states
        set inspection = p_payload, inspection_updated_at = p_client_updated_at
      where lot = p_lot and inspection_updated_at < p_client_updated_at;
 
   elsif p_group = 'commercial' then
-    update public.machine_states
+    update ehs.machine_states
        set commercial = p_payload, commercial_updated_at = p_client_updated_at
      where lot = p_lot and commercial_updated_at < p_client_updated_at;
 
   else
-    update public.machine_states
+    update ehs.machine_states
        set decision   = coalesce(p_payload->>'decision', decision),
            shortlist  = coalesce((p_payload->>'shortlist')::boolean, shortlist),
            decision_updated_at = p_client_updated_at
      where lot = p_lot and decision_updated_at < p_client_updated_at;
   end if;
 
-  get diagnostics v_applied = row_count;
-  return v_applied;
+  get diagnostics v_rows = row_count;
+  return v_rows > 0;
 end;
 $$;
 
-revoke all on function public.sync_machine_state(int, text, jsonb, timestamptz) from public;
-grant execute on function public.sync_machine_state(int, text, jsonb, timestamptz) to authenticated;
+revoke all on function ehs.sync_machine_state(int, text, jsonb, timestamptz) from public;
+grant execute on function ehs.sync_machine_state(int, text, jsonb, timestamptz) to authenticated;
 ```
 
 `sync_machine_state` is **SECURITY INVOKER** on purpose. It must run under the caller's own permissions so the RLS policy on `machine_states` rejects a viewer's write. Making it DEFINER would silently hand every viewer full write access — the single most dangerous mistake available in this plan.
@@ -758,7 +791,7 @@ grant execute on function public.sync_machine_state(int, text, jsonb, timestampt
 - [ ] **Step 2: Apply the migration**
 
 ```bash
-npx supabase db push
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/0002_functions.sql
 ```
 
 - [ ] **Step 3: Seed the three access codes**
@@ -766,8 +799,8 @@ npx supabase db push
 Pick three distinct codes. Replace the placeholders below with your real ones — and do not commit them anywhere.
 
 ```bash
-npx supabase db execute --command "
-insert into public.access_codes (role, code_hash) values
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
+insert into ehs.access_codes (role, code_hash) values
   ('admin',     crypt('CHOOSE-ADMIN-CODE',     gen_salt('bf'))),
   ('inspector', crypt('CHOOSE-INSPECTOR-CODE', gen_salt('bf'))),
   ('viewer',    crypt('CHOOSE-VIEWER-CODE',    gen_salt('bf')))
@@ -777,10 +810,10 @@ on conflict (role) do update set code_hash = excluded.code_hash;"
 - [ ] **Step 4: Verify the codes match and the plaintext is unrecoverable**
 
 ```bash
-npx supabase db execute --command "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select role, code_hash = crypt('CHOOSE-INSPECTOR-CODE', code_hash) as matches,
        left(code_hash, 7) as hash_prefix
-  from public.access_codes order by role;"
+  from ehs.access_codes order by role;"
 ```
 
 Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix` starts `$2a$` or `$2b$` (a bcrypt hash, not the plaintext).
@@ -788,9 +821,9 @@ Expected: three rows; `matches` is `t` only for `inspector`; every `hash_prefix`
 - [ ] **Step 5: Verify stale writes are rejected**
 
 ```bash
-npx supabase db execute --command "
-select public.sync_machine_state(
-  (select min(lot) from public.machines), 'commercial',
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
+select ehs.sync_machine_state(
+  (select min(lot) from ehs.machines), 'commercial',
   '{\"currentBidEur\": 999}'::jsonb, '1999-01-01T00:00:00Z') as should_be_false;"
 ```
 
@@ -810,100 +843,163 @@ git commit -m "feat: add access code redemption and state sync functions"
 Every table currently has RLS on with zero policies, which means nobody can read anything. This task defines who can do what.
 
 **Files:**
-- Create: `supabase/migrations/0003_rls.sql`
+- Create: `db/0003_rls.sql`
 
 **Interfaces:**
-- Consumes: `public.caller_role()` from Task 4
+- Consumes: `ehs.caller_role()` from Task 4
 - Produces: a private `inspection-photos` storage bucket and policies on all eight tables
 
-- [ ] **Step 1: Write `supabase/migrations/0003_rls.sql`**
+- [ ] **Step 1: Write `db/0003_rls.sql`**
 
 ```sql
 -- profiles: everyone with a profile can see the team; you edit only your own
 -- name; only an admin changes roles (via the admin update policy below).
-create policy profiles_select on public.profiles
+create policy profiles_select on ehs.profiles
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy profiles_insert_self on public.profiles
-  for insert to authenticated
-  with check (id = auth.uid());
+-- profiles_insert_self only constrained id, not role: any authenticated
+-- (even anonymous, code-less) user could self-insert as admin. Removed;
+-- redeem_access_code is SECURITY DEFINER and bypasses RLS, so it remains the
+-- only path to a profile row. Drop kept here so re-running this file is
+-- idempotent and never recreates the policy.
+drop policy if exists profiles_insert_self on ehs.profiles;
 
-create policy profiles_update_self on public.profiles
+-- The `role = ehs.caller_role()` check below prevents self-escalation ONLY
+-- because caller_role() is STABLE: inside WITH CHECK it reads the statement's
+-- snapshot and returns the PRE-update role, so the new role is compared against
+-- the old one. Marking caller_role() VOLATILE would silently break this.
+create policy profiles_update_self on ehs.profiles
   for update to authenticated
   using (id = auth.uid())
-  with check (id = auth.uid() and role = public.caller_role());
+  with check (id = auth.uid() and role = ehs.caller_role());
 
-create policy profiles_admin_all on public.profiles
+create policy profiles_admin_all on ehs.profiles
   for all to authenticated
-  using (public.caller_role() = 'admin')
-  with check (public.caller_role() = 'admin');
+  using (ehs.caller_role() = 'admin')
+  with check (ehs.caller_role() = 'admin');
 
 -- access_codes and code_attempts: no client access at all. The SECURITY
 -- DEFINER functions bypass RLS; nothing else may touch these.
 -- (RLS enabled with no policies = deny all.)
 
 -- machines: everyone reads the catalog, only admins change it.
-create policy machines_select on public.machines
+create policy machines_select on ehs.machines
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy machines_admin_write on public.machines
+create policy machines_admin_write on ehs.machines
   for all to authenticated
-  using (public.caller_role() = 'admin')
-  with check (public.caller_role() = 'admin');
+  using (ehs.caller_role() = 'admin')
+  with check (ehs.caller_role() = 'admin');
 
 -- machine_states: everyone reads, inspectors and admins write.
-create policy states_select on public.machine_states
+create policy states_select on ehs.machine_states
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy states_write on public.machine_states
+create policy states_write on ehs.machine_states
   for all to authenticated
-  using (public.caller_role() in ('inspector','admin'))
-  with check (public.caller_role() in ('inspector','admin'));
+  using (ehs.caller_role() in ('inspector','admin'))
+  with check (ehs.caller_role() in ('inspector','admin'));
 
 -- photos: everyone reads, inspectors add, authors and admins delete.
-create policy photos_select on public.photos
+create policy photos_select on ehs.photos
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy photos_insert on public.photos
+create policy photos_insert on ehs.photos
   for insert to authenticated
-  with check (public.caller_role() in ('inspector','admin') and taken_by = auth.uid());
+  with check (ehs.caller_role() in ('inspector','admin') and taken_by = auth.uid());
 
-create policy photos_delete on public.photos
+create policy photos_delete on ehs.photos
   for delete to authenticated
-  using (taken_by = auth.uid() or public.caller_role() = 'admin');
+  using (taken_by = auth.uid() or ehs.caller_role() = 'admin');
+
+create policy photos_update on ehs.photos
+  for update to authenticated
+  using (taken_by = auth.uid() or ehs.caller_role() = 'admin')
+  with check (taken_by = auth.uid() or ehs.caller_role() = 'admin');
 
 -- comments: anyone with a profile posts; authors edit their own for 5 minutes;
 -- authors and admins delete.
-create policy comments_select on public.comments
+create policy comments_select on ehs.comments
   for select to authenticated
-  using (public.caller_role() is not null);
+  using (ehs.caller_role() is not null);
 
-create policy comments_insert on public.comments
+create policy comments_insert on ehs.comments
   for insert to authenticated
-  with check (public.caller_role() is not null and author_id = auth.uid());
+  with check (ehs.caller_role() is not null and author_id = auth.uid());
 
-create policy comments_update_own on public.comments
+create policy comments_update_own on ehs.comments
   for update to authenticated
   using (author_id = auth.uid() and created_at > now() - interval '5 minutes')
   with check (author_id = auth.uid());
 
-create policy comments_delete on public.comments
+create policy comments_delete on ehs.comments
   for delete to authenticated
-  using (author_id = auth.uid() or public.caller_role() = 'admin');
+  using (author_id = auth.uid() or ehs.caller_role() = 'admin');
+
+-- author_name is denormalised so history survives a profile deletion, but it
+-- must be the poster's real name, not free text: without this a viewer could
+-- post a comment displayed as an inspector's name.
+create or replace function ehs.comments_stamp_author()
+returns trigger
+language plpgsql
+security definer
+set search_path = ehs, public, extensions
+as $$
+begin
+  new.author_id   := auth.uid();
+  new.author_name := coalesce(
+    (select display_name from ehs.profiles where id = auth.uid()),
+    'Unknown'
+  );
+  new.created_at  := now();
+  new.edited_at   := null;
+  return new;
+end;
+$$;
+
+drop trigger if exists comments_stamp_author_trg on ehs.comments;
+create trigger comments_stamp_author_trg
+  before insert on ehs.comments
+  for each row execute function ehs.comments_stamp_author();
+
+-- Only the body may change, and only inside the 5-minute window the policy
+-- enforces. Pinning created_at here is what stops the window being extended
+-- indefinitely by PATCHing created_at itself.
+create or replace function ehs.comments_guard_update()
+returns trigger
+language plpgsql
+security definer
+set search_path = ehs, public, extensions
+as $$
+begin
+  new.id         := old.id;
+  new.lot        := old.lot;
+  new.author_id  := old.author_id;
+  new.author_name:= old.author_name;
+  new.created_at := old.created_at;
+  new.edited_at  := now();
+  return new;
+end;
+$$;
+
+drop trigger if exists comments_guard_update_trg on ehs.comments;
+create trigger comments_guard_update_trg
+  before update on ehs.comments
+  for each row execute function ehs.comments_guard_update();
 
 -- comment_reads: strictly your own.
-create policy reads_own on public.comment_reads
+create policy reads_own on ehs.comment_reads
   for all to authenticated
   using (profile_id = auth.uid())
   with check (profile_id = auth.uid());
 
 -- Realtime broadcast for the two tables clients subscribe to.
-alter publication supabase_realtime add table public.machine_states;
-alter publication supabase_realtime add table public.comments;
+alter publication supabase_realtime add table ehs.machine_states;
+alter publication supabase_realtime add table ehs.comments;
 
 -- Private photo bucket.
 insert into storage.buckets (id, name, public)
@@ -912,30 +1008,30 @@ on conflict (id) do nothing;
 
 create policy photos_storage_select on storage.objects
   for select to authenticated
-  using (bucket_id = 'inspection-photos' and public.caller_role() is not null);
+  using (bucket_id = 'inspection-photos' and ehs.caller_role() is not null);
 
 create policy photos_storage_insert on storage.objects
   for insert to authenticated
-  with check (bucket_id = 'inspection-photos' and public.caller_role() in ('inspector','admin'));
+  with check (bucket_id = 'inspection-photos' and ehs.caller_role() in ('inspector','admin'));
 
 create policy photos_storage_delete on storage.objects
   for delete to authenticated
   using (bucket_id = 'inspection-photos'
-         and (owner = auth.uid() or public.caller_role() = 'admin'));
+         and (owner = auth.uid() or ehs.caller_role() = 'admin'));
 ```
 
 - [ ] **Step 2: Apply**
 
 ```bash
-npx supabase db push
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -f db/0003_rls.sql
 ```
 
 - [ ] **Step 3: Verify every table has RLS enabled**
 
 ```bash
-npx supabase db execute --command "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select tablename, rowsecurity
-  from pg_tables where schemaname = 'public' order by tablename;"
+  from pg_tables where schemaname = 'ehs' order by tablename;"
 ```
 
 Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
@@ -943,13 +1039,19 @@ Expected: `rowsecurity` is `t` for all eight tables. Any `f` is a hole.
 - [ ] **Step 4: Verify the two locked tables have no policies**
 
 ```bash
-npx supabase db execute --command "
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
 select tablename, count(*) as policies
-  from pg_policies where schemaname = 'public'
+  from pg_policies where schemaname = 'ehs'
  group by tablename order by tablename;"
 ```
 
 Expected: `access_codes` and `code_attempts` do not appear at all (zero policies = deny all). Every other table appears with at least one.
+
+- [ ] **Step 5a: Expose the `ehs` schema to the Data API**
+
+In the Supabase dashboard: **Settings → API → Data API → Exposed schemas** — add
+`ehs` alongside `public` and save. Without this every client query returns 404
+with `PGRST106`, even though the tables and policies are correct.
 
 - [ ] **Step 5: Enable anonymous sign-ins**
 
@@ -967,7 +1069,8 @@ git commit -m "feat: add row-level security policies and photo storage bucket"
 ### Task 6: Supabase client and anonymous session
 
 **Files:**
-- Create: `src/lib/supabase.ts`, `src/lib/profile.ts`, `src/lib/__tests__/profile.test.ts`
+- Create: `src/lib/keyGuard.ts`, `src/lib/supabase.ts`, `src/lib/profile.ts`
+- Create: `src/lib/__tests__/keyGuard.test.ts`, `src/lib/__tests__/profile.test.ts`
 - Create: `src/vite-env.d.ts`
 
 **Interfaces:**
@@ -1034,10 +1137,107 @@ describe('can', () => {
 Run: `npm test -- profile`
 Expected: FAIL — `Failed to resolve import "../profile"`.
 
-- [ ] **Step 4: Create `src/lib/supabase.ts`**
+- [ ] **Step 4a: Write the failing test for the service_role key guard**
+
+`assertNotServiceRole` is pure (env-access happens at the call site, not inside
+the function), so it is directly unit-testable. Create
+`src/lib/__tests__/keyGuard.test.ts`:
+
+```ts
+import { describe, expect, it } from 'vitest'
+import { assertNotServiceRole } from '../keyGuard'
+
+const jwt = (claims: object) => {
+  const b64 = (o: object) =>
+    btoa(JSON.stringify(o)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+  return `${b64({ alg: 'HS256' })}.${b64(claims)}.sig`
+}
+
+describe('assertNotServiceRole', () => {
+  it('throws in prod for a service_role key, mentioning the anon key', () => {
+    const key = jwt({ role: 'service_role' })
+    expect(() => assertNotServiceRole(key, true)).toThrow(/anon/i)
+  })
+
+  it('returns a warning message (does not throw) in dev for a service_role key', () => {
+    const key = jwt({ role: 'service_role' })
+    expect(assertNotServiceRole(key, false)).toMatch(/service_role/i)
+  })
+
+  it('returns null for an anon-role key in dev and prod', () => {
+    const key = jwt({ role: 'anon' })
+    expect(assertNotServiceRole(key, false)).toBeNull()
+    expect(assertNotServiceRole(key, true)).toBeNull()
+  })
+
+  it('returns null for a non-JWT publishable key', () => {
+    expect(assertNotServiceRole('sb_publishable_abc123', true)).toBeNull()
+  })
+
+  it('returns null for malformed keys instead of throwing', () => {
+    expect(assertNotServiceRole('not.a.jwt', true)).toBeNull()
+    expect(assertNotServiceRole('a.!!!not-base64!!!.c', true)).toBeNull()
+  })
+
+  it('returns null for a JWT with no role claim', () => {
+    const key = jwt({ sub: 'user123' })
+    expect(assertNotServiceRole(key, true)).toBeNull()
+  })
+})
+```
+
+Run: `npm test -- keyGuard`
+Expected: FAIL — `Failed to resolve import "../keyGuard"`.
+
+- [ ] **Step 4b: Create `src/lib/keyGuard.ts`**
+
+```ts
+/**
+ * Guards against shipping a Supabase service_role key to the browser. That key
+ * bypasses row-level security entirely, and this project's database is shared
+ * with an unrelated application, so a published bundle carrying one would expose
+ * every table in the project.
+ *
+ * Pure by design: `isProd` is passed in rather than read from import.meta.env,
+ * so the behaviour is directly testable.
+ *
+ * @returns a warning message when the key is a service_role key in development,
+ *          or null when the key is acceptable.
+ * @throws  when the key is a service_role key and `isProd` is true.
+ */
+export function assertNotServiceRole(key: string, isProd: boolean): string | null {
+  if (roleFromJwt(key) !== 'service_role') return null
+
+  const msg =
+    'VITE_SUPABASE_ANON_KEY is a service_role key. Use the anon/public key - ' +
+    'the service key bypasses row-level security and must never reach a browser.'
+  if (isProd) throw new Error(msg)
+  return msg
+}
+
+/** The `role` claim of a JWT, or null for a non-JWT or unparseable key. */
+function roleFromJwt(key: string): string | null {
+  const parts = key.split('.')
+  if (parts.length !== 3) return null      // sb_publishable_... style key
+  try {
+    const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+    const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4)
+    const claims = JSON.parse(atob(padded))
+    return typeof claims.role === 'string' ? claims.role : null
+  } catch {
+    return null
+  }
+}
+```
+
+Run: `npm test -- keyGuard`
+Expected: PASS.
+
+- [ ] **Step 4c: Create `src/lib/supabase.ts`**
 
 ```ts
 import { createClient } from '@supabase/supabase-js'
+import { assertNotServiceRole } from './keyGuard'
 
 const url = import.meta.env.VITE_SUPABASE_URL
 const key = import.meta.env.VITE_SUPABASE_ANON_KEY
@@ -1048,12 +1248,35 @@ if (!url || !key) {
   )
 }
 
+// Fatal in a production build, which is what gets published. In dev it is only a
+// warning, so local work can continue while the key is being sorted out - but
+// note RLS is NOT being exercised honestly while a service_role key is in use.
+const keyWarning = assertNotServiceRole(key, import.meta.env.PROD)
+if (keyWarning) console.error('[ehs] ' + keyWarning)
+
 export const supabase = createClient(url, key, {
+  db: { schema: 'ehs' },   // this project's public schema belongs to another app
   auth: { persistSession: true, autoRefreshToken: true },
 })
 
-/** Returns the anonymous user id, creating a session on first run. */
-export async function ensureSession(): Promise<string> {
+let sessionPromise: Promise<string> | null = null
+
+/**
+ * Returns the anonymous user id, creating a session on first run.
+ * The in-flight promise is shared so concurrent callers on a cold start do not
+ * each trigger a separate anonymous sign-in.
+ */
+export function ensureSession(): Promise<string> {
+  if (!sessionPromise) {
+    sessionPromise = bootstrapSession().finally(() => { sessionPromise = null })
+  }
+  return sessionPromise
+}
+
+// getSession() in supabase-js v2 refreshes an expired session itself and returns
+// null if the refresh token has been revoked, so a revoked session falls through
+// to a fresh anonymous sign-in below.
+async function bootstrapSession(): Promise<string> {
   const { data: existing } = await supabase.auth.getSession()
   if (existing.session?.user) return existing.session.user.id
 
@@ -1080,7 +1303,7 @@ export type Action = 'write_state' | 'write_catalog' | 'comment'
 
 /**
  * UI convenience only. The authoritative check is the RLS policy in
- * supabase/migrations/0003_rls.sql — never rely on this for security.
+ * db/0003_rls.sql — never rely on this for security.
  */
 export function can(role: Role | null, action: Action): boolean {
   if (!role) return false
@@ -1091,10 +1314,41 @@ export function can(role: Role | null, action: Action): boolean {
   }
 }
 
+const PROFILE_CACHE_KEY = 'ehs-profile-v1'
+
+/**
+ * The last known profile, cached so the app opens offline. Role here is a UI
+ * convenience only - the server re-checks every request against RLS, so a
+ * tampered cache grants nothing.
+ */
+export function cachedProfile(): Profile | null {
+  try {
+    const raw = localStorage.getItem(PROFILE_CACHE_KEY)
+    if (!raw) return null
+    const p = JSON.parse(raw)
+    return p && typeof p.id === 'string' && typeof p.display_name === 'string'
+      && (p.role === 'admin' || p.role === 'inspector' || p.role === 'viewer')
+      ? p as Profile
+      : null
+  } catch {
+    return null
+  }
+}
+
+export function cacheProfile(p: Profile | null): void {
+  try {
+    if (p) localStorage.setItem(PROFILE_CACHE_KEY, JSON.stringify(p))
+    else localStorage.removeItem(PROFILE_CACHE_KEY)
+  } catch { /* private mode or quota: the app still works, just re-prompts */ }
+}
+
 export async function fetchProfile(): Promise<Profile | null> {
   const { data: session } = await supabase.auth.getSession()
   const uid = session.session?.user?.id
-  if (!uid) return null
+  if (!uid) {
+    cacheProfile(null)
+    return null
+  }
 
   const { data, error } = await supabase
     .from('profiles')
@@ -1103,18 +1357,59 @@ export async function fetchProfile(): Promise<Profile | null> {
     .maybeSingle()
 
   if (error) throw error
-  return (data as Profile) ?? null
+  const result = (data as Profile) ?? null
+  cacheProfile(result)
+  return result
+}
+
+function isStaleSessionError(error: { code?: string; message?: string } | null): boolean {
+  if (!error) return false
+  if (error.code === '23503') return true
+  // Defensive fallback: postgrest error shapes vary, so also match on message.
+  const msg = (error.message ?? '').toLowerCase()
+  return msg.includes('foreign key') && msg.includes('profiles')
+}
+
+function mapRedeemResult(data: unknown): Role {
+  if (data === 'invalid_code') throw new Error('That access code is not recognised.')
+  if (data === 'rate_limited') throw new Error('Too many attempts. Wait 15 minutes and try again.')
+  if (data === 'admin' || data === 'inspector' || data === 'viewer') return data
+  throw new Error('Unexpected response from the server. Try again.')
 }
 
 export async function redeemCode(code: string, displayName: string): Promise<Role> {
-  const { data, error } = await supabase.rpc('redeem_access_code', {
-    p_code: code.trim(),
-    p_display_name: displayName.trim(),
-  })
-  if (error) throw new Error(error.message)
-  return data as Role
+  const params = { p_code: code.trim(), p_display_name: displayName.trim() }
+  const { data, error } = await supabase.rpc('redeem_access_code', params)
+
+  if (error) {
+    // An operator deleting a user's auth.users row is the *documented* way to
+    // revoke access in this app (identities are per-device and anonymous, so
+    // there is no account to disable). Without this recovery, the device that
+    // held that session is bricked: the anon session token in localStorage
+    // still "looks" valid to the client, but every insert against `profiles`
+    // fails its FK constraint, and re-entering the code fails identically
+    // forever. Recognise that case and self-heal once: drop the dead session,
+    // mint a fresh anonymous identity, and retry the redemption.
+    if (isStaleSessionError(error)) {
+      const { error: signOutError } = await supabase.auth.signOut()
+      if (signOutError) throw new Error('Could not refresh your session. Try again.')
+      resetSession()
+      await ensureSession()
+
+      const retry = await supabase.rpc('redeem_access_code', params)
+      if (retry.error) {
+        throw new Error('Your session could not be renewed. Please try again.')
+      }
+      return mapRedeemResult(retry.data)
+    }
+    throw new Error(error.message)
+  }
+
+  return mapRedeemResult(data)
 }
 ```
+
+`ensureSession` memoizes its in-flight promise at module scope in `src/lib/supabase.ts`; a `resetSession()` export there clears that memo so the post-signOut `ensureSession()` call above genuinely re-derives a fresh anonymous identity instead of handing back the stale cached one.
 
 - [ ] **Step 6: Run tests**
 
@@ -1143,33 +1438,61 @@ git commit -m "feat: add supabase client, anonymous session and profile helpers"
 - [ ] **Step 1: Create `src/components/Gate.tsx`**
 
 ```tsx
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ensureSession } from '../lib/supabase'
-import { fetchProfile, redeemCode, type Profile } from '../lib/profile'
+import { cachedProfile, cacheProfile, fetchProfile, redeemCode, type Profile } from '../lib/profile'
 
 export function Gate({ children }: { children: (profile: Profile) => React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [booting, setBooting] = useState(true)
+  const [offline, setOffline] = useState(false)
   const [code, setCode] = useState('')
   const [name, setName] = useState('')
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
+  const submitting = useRef(false)
+
+  const boot = useCallback(async () => {
+    setOffline(false)
+    const cached = cachedProfile()
+    if (cached) {
+      setProfile(cached)
+      setBooting(false)
+    } else {
+      setBooting(true)
+    }
+
+    try {
+      await ensureSession()
+      const fresh = await fetchProfile()
+      if (fresh) {
+        setProfile(fresh)
+      } else {
+        // Authoritative: server says no profile. Clear any stale cache.
+        cacheProfile(null)
+        setProfile(null)
+      }
+      setError('')
+    } catch (e) {
+      if (!cached) {
+        setOffline(true)
+        setError(e instanceof Error ? e.message : 'Could not reach the server.')
+      }
+      // If we have a cached profile, keep showing the app - the refresh
+      // failed but there's nothing to correct for yet.
+    } finally {
+      setBooting(false)
+    }
+  }, [])
 
   useEffect(() => {
-    ;(async () => {
-      try {
-        await ensureSession()
-        setProfile(await fetchProfile())
-      } catch (e) {
-        setError(e instanceof Error ? e.message : 'Could not reach the server.')
-      } finally {
-        setBooting(false)
-      }
-    })()
-  }, [])
+    boot()
+  }, [boot])
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (submitting.current) return
+    submitting.current = true
     setError('')
     setBusy(true)
     try {
@@ -1178,12 +1501,28 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not verify that code.')
     } finally {
+      submitting.current = false
       setBusy(false)
     }
   }
 
   if (booting) return <div className="gate"><p>Starting…</p></div>
   if (profile) return <>{children(profile)}</>
+
+  if (offline) {
+    return (
+      <div className="gate">
+        <div className="gate-card">
+          <div className="brand-mark">EHS</div>
+          <h1>Auction Inspector</h1>
+          <p className="gate-error" role="alert">
+            Can't reach the server. Check your connection and try again.
+          </p>
+          <button className="primary wide" onClick={() => boot()}>Retry</button>
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className="gate">
@@ -1194,7 +1533,8 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
 
         <label>Access code
           <input value={code} onChange={e => setCode(e.target.value)}
-                 autoComplete="off" autoCapitalize="none" required />
+                 autoComplete="off" autoCapitalize="none" autoCorrect="off"
+                 spellCheck={false} required />
         </label>
 
         <label>Your name
@@ -1216,6 +1556,12 @@ export function Gate({ children }: { children: (profile: Profile) => React.React
 ```
 
 There is no role dropdown. The code determines the role server-side — that is the whole point of Task 4.
+
+The gate must not block on the network. It renders from `cachedProfile()` first
+and refreshes in the background, so an inspector who redeemed a code yesterday
+gets straight in with no signal. A genuine connection failure shows a distinct
+retry screen, never the code form — otherwise a dead spot looks like a rejected
+code. The cached role is a UI convenience only; RLS re-checks every request.
 
 - [ ] **Step 2: Wrap the app in `src/main.tsx`**
 
@@ -1260,7 +1606,7 @@ function App({ profile }: { profile: Profile }) {
 
 - [ ] **Step 5: Verify manually**
 
-Fill `.env` with your real values, then `npm run dev`. Expected: the gate appears; a wrong code shows "invalid access code"; the inspector code lets you through to the app.
+Fill `.env` with your real values, then `npm run dev`. Expected: the gate appears; a wrong code shows "That access code is not recognised."; the inspector code lets you through to the app.
 
 - [ ] **Step 6: Commit**
 
@@ -1365,6 +1711,8 @@ describe('outbox', () => {
 
   it('dequeues only when the timestamp still matches', async () => {
     await enqueue(entry(412, 'inspection', '2026-09-07T10:00:00.000Z'))
+    await dequeue(412, 'inspection', '2026-09-07T10:00:05.000Z')
+    expect(await listOutbox()).toHaveLength(1)
     await dequeue(412, 'inspection', '2026-09-07T10:00:00.000Z')
     expect(await listOutbox()).toHaveLength(0)
   })
@@ -1393,9 +1741,12 @@ Expected: FAIL — `Failed to resolve import "../db"`.
 import { get, set, del, keys, createStore } from 'idb-keyval'
 import type { MachineState } from '../types'
 
-const stateStore  = createStore('ehs-inspector', 'states')
-const outboxStore = createStore('ehs-inspector', 'outbox')
-const photoStore  = createStore('ehs-inspector', 'photos')
+// Each store gets its own IndexedDB database. idb-keyval's createStore opens
+// its db without a version bump, so multiple stores sharing one db name only
+// ever get the first store created (the others silently 404 on later opens).
+const stateStore  = createStore('ehs-inspector-states', 'states')
+const outboxStore = createStore('ehs-inspector-outbox', 'outbox')
+const photoStore  = createStore('ehs-inspector-photos', 'photos')
 
 export type FieldGroup = 'inspection' | 'commercial' | 'decision'
 
@@ -1403,67 +1754,149 @@ export interface OutboxEntry {
   lot: number
   group: FieldGroup
   payload: unknown
+  // Must be `new Date().toISOString()` output - UTC with a `Z` suffix and
+  // millisecond precision. Collapsing and dequeue-guard logic below compares
+  // these values lexicographically; a local-offset timestamp would sort
+  // wrongly. On an exact tie the newer entry intentionally wins (the guard
+  // is `>`, not `>=`) - a same-millisecond re-edit should overwrite.
   updatedAt: string   // ISO 8601
 }
 
 const outboxKey = (lot: number, group: FieldGroup) => `${lot}:${group}`
 
+type StorageErrorListener = (message: string) => void
+const storageErrorListeners = new Set<StorageErrorListener>()
+
+/**
+ * Storage failures are not recoverable in place - quota exceeded, private
+ * browsing, a blocked upgrade - but the user must be told, because the
+ * local copy is the source of truth and a silent failure loses their work.
+ */
+export function onStorageError(fn: StorageErrorListener): () => void {
+  storageErrorListeners.add(fn)
+  return () => { storageErrorListeners.delete(fn) }
+}
+
+function reportStorageError(op: string, err: unknown): void {
+  const detail = err instanceof Error ? err.message : String(err)
+  const message =
+    detail.toLowerCase().includes('quota')
+      ? 'Device storage is full. Export your session and clear photos to continue saving.'
+      : `Could not save to this device (${op}). Your last change may not be stored.`
+  storageErrorListeners.forEach(fn => fn(message))
+}
+
 export async function getState(lot: number): Promise<MachineState | null> {
-  return (await get<MachineState>(String(lot), stateStore)) ?? null
+  try {
+    return (await get<MachineState>(String(lot), stateStore)) ?? null
+  } catch (err) {
+    reportStorageError('getState', err)
+    return null
+  }
 }
 
 export async function putState(lot: number, state: MachineState): Promise<void> {
-  await set(String(lot), state, stateStore)
+  try {
+    await set(String(lot), state, stateStore)
+  } catch (err) {
+    reportStorageError('putState', err)
+    throw err
+  }
 }
 
 export async function getAllStates(): Promise<Record<number, MachineState>> {
-  const all: Record<number, MachineState> = {}
-  for (const k of await keys(stateStore)) {
-    const s = await get<MachineState>(k as string, stateStore)
-    if (s) all[Number(k)] = s
+  try {
+    const all: Record<number, MachineState> = {}
+    for (const k of await keys(stateStore)) {
+      const s = await get<MachineState>(k as string, stateStore)
+      if (s) all[Number(k)] = s
+    }
+    return all
+  } catch (err) {
+    reportStorageError('getAllStates', err)
+    return {}
   }
-  return all
 }
 
 export async function enqueue(entry: OutboxEntry): Promise<void> {
-  const key = outboxKey(entry.lot, entry.group)
-  const existing = await get<OutboxEntry>(key, outboxStore)
-  // Collapse to the newest edit. An out-of-order enqueue must not win.
-  if (existing && existing.updatedAt > entry.updatedAt) return
-  await set(key, entry, outboxStore)
+  try {
+    const key = outboxKey(entry.lot, entry.group)
+    const existing = await get<OutboxEntry>(key, outboxStore)
+    // Collapse to the newest edit. An out-of-order enqueue must not win.
+    if (existing && existing.updatedAt > entry.updatedAt) return
+    await set(key, entry, outboxStore)
+  } catch (err) {
+    reportStorageError('enqueue', err)
+    throw err
+  }
 }
 
 export async function listOutbox(): Promise<OutboxEntry[]> {
-  const out: OutboxEntry[] = []
-  for (const k of await keys(outboxStore)) {
-    const e = await get<OutboxEntry>(k as string, outboxStore)
-    if (e) out.push(e)
+  try {
+    const out: OutboxEntry[] = []
+    for (const k of await keys(outboxStore)) {
+      const e = await get<OutboxEntry>(k as string, outboxStore)
+      if (e) out.push(e)
+    }
+    return out.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
+  } catch (err) {
+    reportStorageError('listOutbox', err)
+    return []
   }
-  return out.sort((a, b) => a.updatedAt.localeCompare(b.updatedAt))
 }
 
 /** Clears the entry only if it has not been superseded by a newer edit. */
 export async function dequeue(lot: number, group: FieldGroup, updatedAt: string): Promise<void> {
-  const key = outboxKey(lot, group)
-  const existing = await get<OutboxEntry>(key, outboxStore)
-  if (existing && existing.updatedAt === updatedAt) await del(key, outboxStore)
+  try {
+    const key = outboxKey(lot, group)
+    const existing = await get<OutboxEntry>(key, outboxStore)
+    if (existing && existing.updatedAt === updatedAt) await del(key, outboxStore)
+  } catch (err) {
+    reportStorageError('dequeue', err)
+    throw err
+  }
 }
 
 export async function isDirty(lot: number, group: FieldGroup): Promise<boolean> {
-  return (await get<OutboxEntry>(outboxKey(lot, group), outboxStore)) !== undefined
+  try {
+    return (await get<OutboxEntry>(outboxKey(lot, group), outboxStore)) !== undefined
+  } catch (err) {
+    reportStorageError('isDirty', err)
+    return false
+  }
 }
 
 export async function putPhotoBlob(id: string, blob: Blob): Promise<void> {
-  await set(id, blob, photoStore)
+  try {
+    await set(id, blob, photoStore)
+  } catch (err) {
+    reportStorageError('putPhotoBlob', err)
+    throw err
+  }
 }
 export async function getPhotoBlob(id: string): Promise<Blob | null> {
-  return (await get<Blob>(id, photoStore)) ?? null
+  try {
+    return (await get<Blob>(id, photoStore)) ?? null
+  } catch (err) {
+    reportStorageError('getPhotoBlob', err)
+    return null
+  }
 }
 export async function deletePhotoBlob(id: string): Promise<void> {
-  await del(id, photoStore)
+  try {
+    await del(id, photoStore)
+  } catch (err) {
+    reportStorageError('deletePhotoBlob', err)
+    throw err
+  }
 }
 export async function listPendingPhotos(): Promise<string[]> {
-  return (await keys(photoStore)).map(String)
+  try {
+    return (await keys(photoStore)).map(String)
+  } catch (err) {
+    reportStorageError('listPendingPhotos', err)
+    return []
+  }
 }
 
 /** Test helper. Also used by the "reset this device" action in Settings. */
@@ -1595,6 +2028,7 @@ Expected: FAIL — `Failed to resolve import "../sync"`.
 ```ts
 import { supabase } from './supabase'
 import { dequeue, listOutbox, putState, type FieldGroup } from './db'
+import { blankState } from './calc'
 import type { MachineState } from '../types'
 
 export type SyncStatus = 'synced' | 'pending' | 'offline' | 'error'
@@ -1608,6 +2042,13 @@ export interface SyncSnapshot {
 let snapshot: SyncSnapshot = { status: 'synced', pending: 0, lastSyncedAt: null }
 const listeners = new Set<(s: SyncSnapshot) => void>()
 let draining = false
+
+// Lots skipped by the realtime handler because they were dirty at the time -
+// they need a follow-up pull once their outbox entries have cleared, since
+// nothing else re-fetches them and pullAll only runs once at boot.
+const pendingPull = new Set<number>()
+const PENDING_PULL_LIMIT = 50
+let currentOnRemoteState: ((lot: number, state: MachineState) => void) | null = null
 
 export function subscribeStatus(fn: (s: SyncSnapshot) => void): () => void {
   listeners.add(fn)
@@ -1633,20 +2074,32 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   let pushed = 0, failed = 0
 
   try {
-    for (const e of await listOutbox()) {
-      const { data, error } = await supabase.rpc('sync_machine_state', {
-        p_lot: e.lot,
-        p_group: e.group,
-        p_payload: e.payload,
-        p_client_updated_at: e.updatedAt,
-      })
+    // Re-check after each pass: edits made while a push was in flight would
+    // otherwise wait for the next interval tick, and the badge would read
+    // "synced" while an entry was still queued.
+    for (;;) {
+      const batch = await listOutbox()
+      if (batch.length === 0) break
+      let progressed = false
 
-      if (error) { failed++; continue }   // stays queued, retried later
-      // data === false means the server already holds a newer value.
-      // Our copy is stale; clearing it is correct, retrying is not.
-      await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
-      pushed++
-      void data
+      for (const e of batch) {
+        const { data, error } = await supabase.rpc('sync_machine_state', {
+          p_lot: e.lot,
+          p_group: e.group,
+          p_payload: e.payload,
+          p_client_updated_at: e.updatedAt,
+        })
+
+        if (error) { failed++; continue }   // stays queued, retried later
+        // data === false means the server already holds a newer value.
+        // Our copy is stale; clearing it is correct, retrying is not.
+        await dequeue(e.lot, e.group as FieldGroup, e.updatedAt)
+        pushed++
+        progressed = true
+        void data
+      }
+
+      if (!progressed) break   // every remaining entry failed; retry later
     }
   } finally {
     draining = false
@@ -1655,16 +2108,69 @@ export async function drainOutbox(): Promise<{ pushed: number; failed: number }>
   await refreshPending()
   if (pushed && !failed) emit({ lastSyncedAt: new Date().toISOString() })
   if (failed) emit({ status: navigator.onLine ? 'error' : 'offline' })
+
+  // Reconcile lots the realtime handler skipped while they were dirty. Only
+  // once the outbox is fully drained (empty), otherwise a lot could still be
+  // mid-push and we'd race with it.
+  if ((await listOutbox()).length === 0 && pendingPull.size > 0) {
+    await reconcilePending()
+  }
+
   return { pushed, failed }
 }
 
+async function reconcilePending(): Promise<void> {
+  if (pendingPull.size > PENDING_PULL_LIMIT) {
+    // Cheaper to just refetch everything than track hundreds of rows.
+    const lots = [...pendingPull]
+    pendingPull.clear()
+    try {
+      const remote = await pullAll()
+      for (const lot of lots) {
+        const state = remote[lot]
+        if (!state) continue
+        await putState(lot, state)
+        currentOnRemoteState?.(lot, state)
+      }
+    } catch { /* offline: try again on the next drain */ }
+    return
+  }
+
+  for (const lot of [...pendingPull]) {
+    const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+    const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
+    if (dirty.some(Boolean)) continue // still dirty: leave queued, retry next time
+
+    const state = await pullLot(lot)
+    pendingPull.delete(lot)
+    if (!state) continue
+    await putState(lot, state)
+    currentOnRemoteState?.(lot, state)
+  }
+}
+
+export async function pullLot(lot: number): Promise<MachineState | null> {
+  const { data, error } = await supabase
+    .from('machine_states')
+    .select('*')
+    .eq('lot', lot)
+    .maybeSingle()
+  if (error || !data) return null
+  return rowToState(data)
+}
+
+// The server stores {} for untouched lots' inspection/commercial columns, so
+// defaults must be merged in here rather than left to every consumer - a
+// shallow merge downstream (`{ ...blankState(), ...pulled }`) would replace
+// the whole default inspection object and drop `scores`/`critical`.
 function rowToState(row: any): MachineState {
+  const base = blankState()
   return {
-    inspection: row.inspection ?? {},
-    commercial: row.commercial ?? {},
-    decision: row.decision,
-    shortlist: row.shortlist,
-  } as MachineState
+    inspection: { ...base.inspection, ...(row.inspection ?? {}) },
+    commercial: { ...base.commercial, ...(row.commercial ?? {}) },
+    decision:   row.decision  ?? base.decision,
+    shortlist:  row.shortlist ?? base.shortlist,
+  }
 }
 
 export async function pullAll(): Promise<Record<number, MachineState>> {
@@ -1680,6 +2186,7 @@ export async function pullAll(): Promise<Record<number, MachineState>> {
  * inbound realtime rows. Returns a cleanup function.
  */
 export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
+  currentOnRemoteState = onRemoteState
   const online  = () => { void refreshPending().then(() => drainOutbox()) }
   const offline = () => emit({ status: 'offline' })
 
@@ -1691,10 +2198,21 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
   const channel = supabase
     .channel('machine_states_stream')
     .on('postgres_changes',
-        { event: '*', schema: 'public', table: 'machine_states' },
+        { event: '*', schema: 'ehs', table: 'machine_states' },
         async payload => {
           const row: any = payload.new
           if (!row?.lot) return
+          // Never overwrite a lot with unsynced local edits - the outbox is the
+          // durable record of those, and it survives reloads.
+          const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
+          const dirty = await Promise.all(groups.map(g => isDirty(row.lot, g)))
+          if (dirty.some(Boolean)) {
+            if (pendingPull.size >= PENDING_PULL_LIMIT) {
+              pendingPull.clear()
+            }
+            pendingPull.add(row.lot)
+            return
+          }
           const state = rowToState(row)
           await putState(row.lot, state)
           onRemoteState(row.lot, state)
@@ -1708,16 +2226,20 @@ export function startSync(onRemoteState: (lot: number, state: MachineState) => v
     window.removeEventListener('offline', offline)
     window.clearInterval(timer)
     void supabase.removeChannel(channel)
+    currentOnRemoteState = null
+    pendingPull.clear()
   }
 }
 ```
 
-The caller of `onRemoteState` is responsible for not clobbering a locally-dirty lot — that check lives in `useMachineState` (Task 10), which knows what the user is currently editing.
+The dirty check lives here, not with the caller: the outbox (`isDirty` from `db.ts`) is the durable record of unsynced local edits — it survives reloads, unlike any in-memory flag — and both the cache write (`putState`) and the caller's `onRemoteState` callback must be gated on it. `useMachineState` (Task 10) therefore no longer needs its own dirty check for realtime rows; it only needs one for the initial pull, since that runs before `startSync` is ever wired up.
+
+A lot that is skipped because it is dirty is not simply dropped: it is queued in `pendingPull` and reconciled the next time `drainOutbox` finishes a pass with an empty outbox, by pulling that single row (`pullLot`), applying it, and firing `onRemoteState` — so a realtime update that arrives mid-edit is not lost, only delayed until the local edit has synced. `pendingPull` is capped at `PENDING_PULL_LIMIT` (50) to bound memory; past that it is cleared and a full `pullAll`-style reconcile is done instead.
 
 - [ ] **Step 4: Run tests**
 
 Run: `npm test -- sync`
-Expected: PASS, 6 tests.
+Expected: PASS, 9 tests (6 original + 3 covering realtime dirty-skip, dirty-clean apply, and pending-pull reconciliation).
 
 - [ ] **Step 5: Commit**
 
@@ -1738,6 +2260,7 @@ Replaces the `useState(loadAll)` + `useEffect(localStorage.setItem)` pair at `sr
 
 **Interfaces:**
 - Consumes: `db.ts` (Task 8), `sync.ts` (Task 9), `blankState` (Task 2)
+- Note: `pullAll` (Task 9) always returns fully-defaulted `MachineState`s — `inspection`/`commercial` are merged against `blankState()`, so consumers do not need to re-merge defaults. Consumers should also subscribe to `onStorageError` (Task 8) to surface local storage failures (quota exceeded, private browsing, blocked upgrade) to the user, since a failed write is otherwise silent.
 - Produces:
   - `useAllMachineStates(canWrite: boolean)` returning
     `{ states: Record<number, MachineState>; ready: boolean; patchState(lot, group, fn): void }`
@@ -1751,8 +2274,10 @@ import type { MachineState } from '../types'
 import { blankState } from '../lib/calc'
 import { machines } from '../data'
 import { enqueue, getAllStates, isDirty, putState } from '../lib/db'
-import { drainOutbox, pullAll, startSync } from '../lib/sync'
+import { drainOutbox, pullAll, refreshPending, startSync } from '../lib/sync'
 import type { FieldGroup } from '../lib/db'
+
+const GROUPS: FieldGroup[] = ['inspection', 'commercial', 'decision']
 
 function seed(partial: Record<number, MachineState>): Record<number, MachineState> {
   return Object.fromEntries(
@@ -1763,7 +2288,13 @@ function seed(partial: Record<number, MachineState>): Record<number, MachineStat
 export function useAllMachineStates(canWrite: boolean) {
   const [states, setStates] = useState<Record<number, MachineState>>(() => seed({}))
   const [ready, setReady] = useState(false)
-  const dirtyRef = useRef<Set<string>>(new Set())
+  const statesRef = useRef(states)
+  useEffect(() => { statesRef.current = states }, [states])
+  // Lots edited in this session - the boot pull must never overwrite one of
+  // these regardless of what the outbox says at any given instant, since an
+  // edit made between the isDirty check and the putState below would
+  // otherwise be silently reverted.
+  const touchedRef = useRef<Set<number>>(new Set())
 
   // Boot: local cache first (instant, works offline), then the server.
   useEffect(() => {
@@ -1774,10 +2305,22 @@ export function useAllMachineStates(canWrite: boolean) {
       try {
         const remote = await pullAll()
         if (cancelled) return
-        for (const [lot, state] of Object.entries(remote)) {
-          // Never overwrite a lot with unsent local edits.
-          if (dirtyRef.current.has(`${lot}:inspection`)) continue
-          await putState(Number(lot), state)
+        // The outbox is the durable record of unsynced work - an in-memory
+        // dirty flag would be empty after a reload, and pulling would then
+        // overwrite an inspector's offline edits. Guard every group, not
+        // just 'inspection': a dirty commercial or decision edit is just as
+        // real, and the server would otherwise clobber it.
+        for (const [lotKey, state] of Object.entries(remote)) {
+          const lot = Number(lotKey)
+          if (touchedRef.current.has(lot)) continue
+          const dirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
+          if (dirty.some(Boolean)) continue
+          // Narrow the window further: re-check immediately before the write
+          // in case an edit landed while the first check was in flight.
+          if (touchedRef.current.has(lot)) continue
+          const stillDirty = await Promise.all(GROUPS.map(g => isDirty(lot, g)))
+          if (stillDirty.some(Boolean)) continue
+          await putState(lot, state)
         }
         setStates(seed({ ...(await getAllStates()) }))
       } catch { /* offline: the local cache stands */ }
@@ -1785,39 +2328,40 @@ export function useAllMachineStates(canWrite: boolean) {
     return () => { cancelled = true }
   }, [])
 
-  // Realtime: apply inbound rows unless the lot is locally dirty.
-  useEffect(() => startSync(async (lot, remote) => {
-    const groups: FieldGroup[] = ['inspection', 'commercial', 'decision']
-    const dirty = await Promise.all(groups.map(g => isDirty(lot, g)))
-    if (dirty.some(Boolean)) return
+  // Realtime: sync.ts (Task 9) already guards against overwriting a dirty
+  // lot before it ever calls this, so it only needs to apply what it's given.
+  useEffect(() => startSync((lot, remote) => {
     setStates(prev => ({ ...prev, [lot]: { ...blankState(), ...remote } }))
   }), [])
 
   const patchState = useCallback((lot: number, group: FieldGroup, fn: (s: MachineState) => MachineState) => {
     if (!canWrite) return
+    touchedRef.current.add(lot)
     const updatedAt = new Date().toISOString()
+    // Computed from a ref, not inside the setStates updater: React may invoke
+    // that updater twice under StrictMode, and putState/enqueue must not fire twice.
+    const next = fn(statesRef.current[lot] ?? blankState())
+    const payload =
+      group === 'inspection' ? next.inspection :
+      group === 'commercial' ? next.commercial :
+      { decision: next.decision, shortlist: next.shortlist }
 
-    setStates(prev => {
-      const next = fn(prev[lot] ?? blankState())
-      const payload =
-        group === 'inspection' ? next.inspection :
-        group === 'commercial' ? next.commercial :
-        { decision: next.decision, shortlist: next.shortlist }
+    setStates(prev => ({ ...prev, [lot]: next }))
 
-      dirtyRef.current.add(`${lot}:${group}`)
-      // Fire-and-forget: the UI must not wait on storage or the network.
-      void putState(lot, next)
-      void enqueue({ lot, group, payload, updatedAt })
-        .then(() => { if (navigator.onLine) return drainOutbox() })
-        .finally(() => dirtyRef.current.delete(`${lot}:${group}`))
-
-      return { ...prev, [lot]: next }
-    })
+    // Fire-and-forget: the UI must never wait on storage or the network.
+    // db.ts reports failures via onStorageError, so these catches only swallow.
+    void putState(lot, next).catch(() => {})
+    void enqueue({ lot, group, payload, updatedAt })
+      .then(() => refreshPending())
+      .then(() => { if (navigator.onLine) return drainOutbox() })
+      .catch(() => {})
   }, [canWrite])
 
   return { states, ready, patchState }
 }
 ```
+
+`refreshPending()` runs unconditionally as soon as `enqueue` resolves, before the online check — an offline edit must still update `sync.pending`, or `SignOut`'s guard (Task 11 / `SignOut.tsx`) will read a stale 0 and never arm.
 
 - [ ] **Step 2: Create `src/components/SyncBadge.tsx`**
 
@@ -1894,12 +2438,88 @@ Put the badge and the user's identity in the header, next to the existing Export
 <div className="header-actions">
   <SyncBadge />
   <Badge tone="live">Zevenbergen · 9 Sep</Badge>
-  <span className="who">{profile.display_name} · {profile.role}</span>
+  <span className="who" title="Your identity on this device">
+    {profile.display_name} · {profile.role}
+  </span>
   <button className="ghost" onClick={exportData}>Export</button>
 </div>
 ```
 
+**Viewer banner.** Disabled controls with no explanation read as a broken app, and
+someone will waste time at an auction trying to fix it instead of realising they
+are on the wrong code. Add above the inspection layout, and again above the bid
+board table:
+
+```tsx
+{!canWrite && (
+  <div className="viewer-note" role="status">
+    You are signed in as a <strong>viewer</strong>. You can read everything and
+    post comments, but not change inspection data.
+  </div>
+)}
+```
+
+```css
+.viewer-note { margin: 0 0 14px; padding: 10px 14px; border-radius: 10px;
+  background: #eef3fb; color: #2c4a7c; font-size: 13px; font-weight: 600; }
+```
+
+Controls are **disabled, not hidden**, so a viewer in India and an inspector in
+Moerdijk see the same screen layout while talking on the phone. The comment
+composer stays fully enabled - commenting is the viewer's actual job.
+
 Pass `canWrite` down to `CommercialForm` and add `disabled={!canWrite}` to its inputs, the score buttons, the critical-gate buttons and the bid-board status select, so a viewer sees the data as read-only rather than clicking into a silent rejection.
+
+- [ ] **Step 4b: Sign out (Settings tab)**
+
+Add to `src/components/SignOut.tsx`:
+
+```tsx
+import { useEffect, useState } from 'react'
+import { supabase } from '../lib/supabase'
+import { cacheProfile } from '../lib/profile'
+import { subscribeStatus, type SyncSnapshot } from '../lib/sync'
+
+/**
+ * Signing out destroys the anonymous identity permanently - there is no signing
+ * back into it, only redeeming a code as a new user. So it is blocked while any
+ * edit is still queued: an inspector must never be able to wipe a morning's work
+ * with one mistap at a live auction.
+ */
+export function SignOut() {
+  const [sync, setSync] = useState<SyncSnapshot>({ status: 'synced', pending: 0, lastSyncedAt: null })
+  useEffect(() => subscribeStatus(setSync), [])
+
+  const blocked = sync.pending > 0
+
+  const signOut = async () => {
+    if (blocked) return
+    if (!confirm('Sign out of this device? You will need an access code to get back in.')) return
+    cacheProfile(null)
+    await supabase.auth.signOut()
+    location.reload()
+  }
+
+  return (
+    <div className="panel danger-panel">
+      <h3>Sign out</h3>
+      <p>Clears your identity on this device. Anyone using it next will need an
+         access code. Inspection data already uploaded is not affected.</p>
+      {blocked && (
+        <p className="muted" role="status">
+          {sync.pending} change{sync.pending > 1 ? 's have' : ' has'} not uploaded yet.
+          Sign-out is available once everything has synced.
+        </p>
+      )}
+      <button className="danger-button" onClick={signOut} disabled={blocked}>
+        {blocked ? 'Waiting for sync…' : 'Sign out'}
+      </button>
+    </div>
+  )
+}
+```
+
+Mount it in the Settings tab, above the "Reset this device" panel.
 
 - [ ] **Step 5: Update the Settings tab copy and reset action**
 
@@ -1948,7 +2568,7 @@ git commit -m "feat: replace localStorage with local-first IndexedDB state and s
 - [ ] **Step 1: Create `src/components/Photos.tsx`**
 
 ```tsx
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { supabase } from '../lib/supabase'
 import { deletePhotoBlob, getPhotoBlob, listPendingPhotos, putPhotoBlob } from '../lib/db'
 
@@ -1977,39 +2597,89 @@ function downscale(file: File): Promise<Blob> {
   })
 }
 
+const SIGNED_URL_TTL = 3600
+const SIGNED_URL_REFRESH_MS = 45 * 60 * 1000
+
 export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: boolean; profileId: string }) {
   const [shots, setShots] = useState<Shot[]>([])
   const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  // Tracks object URLs from the previous render so they can be revoked once
+  // replaced - otherwise a long inspection session leaks memory on a phone.
+  const objectUrls = useRef<string[]>([])
 
   const load = useCallback(async () => {
     const { data } = await supabase.from('photos')
       .select('id, storage_path').eq('lot', lot).order('created_at', { ascending: false })
 
+    const rows = data ?? []
     const uploaded: Shot[] = []
-    for (const row of data ?? []) {
-      const { data: signed } = await supabase.storage
-        .from('inspection-photos').createSignedUrl(row.storage_path, 3600)
-      if (signed?.signedUrl) uploaded.push({ id: row.id, url: signed.signedUrl, pending: false })
+    if (rows.length > 0) {
+      const paths = rows.map(row => row.storage_path)
+      const { data: signedList } = await supabase.storage
+        .from('inspection-photos').createSignedUrls(paths, SIGNED_URL_TTL)
+      const urlByPath = new Map<string, string>()
+      for (const signed of signedList ?? []) {
+        if (signed.signedUrl && signed.path) urlByPath.set(signed.path, signed.signedUrl)
+      }
+      for (const row of rows) {
+        const url = urlByPath.get(row.storage_path)
+        if (url) uploaded.push({ id: row.id, url, pending: false })
+      }
     }
 
     const pending: Shot[] = []
+    const newObjectUrls: string[] = []
     for (const id of await listPendingPhotos()) {
       if (!id.startsWith(`${lot}/`)) continue
       const blob = await getPhotoBlob(id)
-      if (blob) pending.push({ id, url: URL.createObjectURL(blob), pending: true })
+      if (blob) {
+        const url = URL.createObjectURL(blob)
+        newObjectUrls.push(url)
+        pending.push({ id, url, pending: true })
+      }
     }
+
+    // Revoke the object URLs from the previous load now that they are
+    // being replaced.
+    objectUrls.current.forEach(u => URL.revokeObjectURL(u))
+    objectUrls.current = newObjectUrls
 
     setShots([...pending, ...uploaded])
   }, [lot])
 
   useEffect(() => { void load() }, [load])
 
+  // Revoke any outstanding object URLs on unmount.
+  useEffect(() => () => { objectUrls.current.forEach(u => URL.revokeObjectURL(u)) }, [])
+
+  // Signed URLs expire after SIGNED_URL_TTL seconds. Refresh well inside
+  // that window on a timer, and again whenever the tab regains visibility -
+  // a viewer can leave the tab open for hours.
+  useEffect(() => {
+    const interval = setInterval(() => { void load() }, SIGNED_URL_REFRESH_MS)
+    const onVisible = () => { if (document.visibilityState === 'visible') void load() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [load])
+
   const upload = async (id: string, blob: Blob) => {
-    const { error } = await supabase.storage
-      .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg' })
-    if (error) return                       // stays pending, retried on next load
-    await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
+    const { error: uploadError } = await supabase.storage
+      .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg', upsert: true })
+    if (uploadError) return false           // stays pending, retried on next load
+
+    const { error: insertError } = await supabase.from('photos').insert({ lot, storage_path: id, taken_by: profileId })
+    // A unique-violation on storage_path means a previous attempt already
+    // created the row (e.g. storage succeeded but the insert failed or the
+    // connection dropped before the response arrived). That is success, not
+    // failure - the evidence is already recorded.
+    if (insertError && insertError.code !== '23505') return false
+
     await deletePhotoBlob(id)
+    return true
   }
 
   const onPick = async (files: FileList | null) => {
@@ -2017,11 +2687,20 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
     setBusy(true)
     try {
       for (const file of Array.from(files).slice(0, 6)) {
-        const blob = await downscale(file)
+        let blob: Blob
+        try {
+          blob = await downscale(file)
+        } catch {
+          setError('Could not read that image. Try taking the photo again.')
+          continue                          // skip this file, keep processing the rest
+        }
         const id = `${lot}/${crypto.randomUUID()}.jpg`
         await putPhotoBlob(id, blob)        // survives a crash or signal loss
         await load()                        // show it immediately
-        if (navigator.onLine) await upload(id, blob)
+        if (navigator.onLine) {
+          const ok = await upload(id, blob)
+          if (ok) setError('')
+        }
       }
       await load()
     } finally {
@@ -2029,19 +2708,33 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
     }
   }
 
-  // Retry anything left pending whenever the connection returns.
+  // Retry anything left pending whenever the connection returns. Subscribed
+  // once per lot (not on every render) so the listener isn't added/removed
+  // on every render.
   useEffect(() => {
     const retry = async () => {
+      let allOk = true
       for (const id of await listPendingPhotos()) {
         if (!id.startsWith(`${lot}/`)) continue
         const blob = await getPhotoBlob(id)
-        if (blob) await upload(id, blob)
+        if (blob) {
+          const ok = await upload(id, blob)
+          if (!ok) allOk = false
+        }
       }
+      if (allOk) setError('')
       await load()
     }
     window.addEventListener('online', retry)
     return () => window.removeEventListener('online', retry)
-  })
+  }, [lot, load])
+
+  // An offline inspector is expected to have pending photos - only surface a
+  // failure note once the device is online and photos are still stuck.
+  const pendingCount = shots.filter(s => s.pending).length
+  const pendingNote = pendingCount > 0 && navigator.onLine
+    ? `${pendingCount} photo${pendingCount > 1 ? 's' : ''} could not upload. ${pendingCount > 1 ? 'They are' : 'It is'} saved on this device and will retry.`
+    : ''
 
   return (
     <div className="photos">
@@ -2052,6 +2745,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
           <small>Stored on this device immediately, uploaded when there is signal.</small>
         </label>
       )}
+      {(error || pendingNote) && <p className="photo-error" role="alert">{error || pendingNote}</p>}
       {shots.length > 0 && (
         <div className="photo-grid full">
           {shots.map(s => (
@@ -2089,7 +2783,7 @@ Where the old photo input and grid were (removed in Task 2), add:
 `npm run dev`, enter as inspector, add a photo. Expected: it appears instantly with "Waiting to upload", then the caption disappears. Confirm the row landed:
 
 ```bash
-npx supabase db execute --command "select lot, storage_path, created_at from public.photos order by created_at desc limit 5;"
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "select lot, storage_path, created_at from ehs.photos order by created_at desc limit 5;"
 ```
 
 Then open DevTools → Network → Offline, add another photo, and confirm it appears as pending and uploads when you go back online.
@@ -2129,6 +2823,17 @@ interface Comment {
   created_at: string
 }
 
+/**
+ * Opening a thread writes a comment_reads row, but that write raises no
+ * realtime event, so the badge would keep showing a stale count until the next
+ * comment posted anywhere. This tells the badge directly.
+ */
+const readListeners = new Set<(lot: number) => void>()
+
+function notifyRead(lot: number): void {
+  readListeners.forEach(fn => fn(lot))
+}
+
 export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
   const [items, setItems] = useState<Comment[]>([])
   const [draft, setDraft] = useState('')
@@ -2140,6 +2845,7 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
     setItems((data ?? []) as Comment[])
     await supabase.from('comment_reads')
       .upsert({ profile_id: profile.id, lot, last_read_at: new Date().toISOString() })
+    notifyRead(lot)
   }, [lot, profile.id])
 
   useEffect(() => { void load() }, [load])
@@ -2147,14 +2853,22 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
   useEffect(() => {
     const channel = supabase.channel(`comments_${lot}`)
       .on('postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'comments', filter: `lot=eq.${lot}` },
-          payload => setItems(prev =>
-            prev.some(c => c.id === (payload.new as Comment).id)
-              ? prev
-              : [...prev, payload.new as Comment]))
+          { event: 'INSERT', schema: 'ehs', table: 'comments', filter: `lot=eq.${lot}` },
+          payload => {
+            setItems(prev =>
+              prev.some(c => c.id === (payload.new as Comment).id)
+                ? prev
+                : [...prev, payload.new as Comment])
+            // The thread is open and visible, so a comment arriving for this
+            // lot right now has effectively been seen — mark it read again
+            // rather than letting the badge count it as unread.
+            void supabase.from('comment_reads')
+              .upsert({ profile_id: profile.id, lot, last_read_at: new Date().toISOString() })
+              .then(() => notifyRead(lot))
+          })
       .subscribe()
     return () => { void supabase.removeChannel(channel) }
-  }, [lot])
+  }, [lot, profile.id])
 
   const post = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -2216,12 +2930,20 @@ export function useUnreadCounts(profileId: string): Record<number, number> {
     }
     void compute()
 
+    const onRead = (lot: number) => {
+      setCounts(prev => (prev[lot] ? { ...prev, [lot]: 0 } : prev))
+    }
+    readListeners.add(onRead)
+
     const channel = supabase.channel('comments_unread')
       .on('postgres_changes',
-          { event: 'INSERT', schema: 'public', table: 'comments' },
+          { event: 'INSERT', schema: 'ehs', table: 'comments' },
           () => { void compute() })
       .subscribe()
-    return () => { void supabase.removeChannel(channel) }
+    return () => {
+      readListeners.delete(onRead)
+      void supabase.removeChannel(channel)
+    }
   }, [profileId])
 
   return counts
@@ -2357,6 +3079,10 @@ function hasWork(s: MachineState): boolean {
   if (Object.values(s.inspection?.scores ?? {}).some(v => v > 0)) return true
   if (Object.values(s.inspection?.critical ?? {}).some(v => v !== 'UNSET')) return true
   if ((s.inspection?.notes ?? '').trim()) return true
+  // An inspector who recorded only who they are and when they looked has still
+  // done work worth keeping - dropping it would lose the provenance of a visit.
+  if ((s.inspection?.inspector ?? '').trim()) return true
+  if ((s.inspection?.inspectedAt ?? '').trim()) return true
   if (s.inspection?.repairEstimateEur) return true
   if (s.commercial?.currentBidEur) return true
   if (s.commercial?.estimatedResaleInr) return true
@@ -2482,7 +3208,9 @@ const check = (name, ok) => {
 }
 
 async function asRole(role) {
-  const client = createClient(URL, KEY, { auth: { persistSession: false } })
+  const client = createClient(URL, KEY, {
+    db: { schema: 'ehs' }, auth: { persistSession: false },
+  })
   const { error: authErr } = await client.auth.signInAnonymously()
   if (authErr) throw authErr
   const { data, error } = await client.rpc('redeem_access_code', {
@@ -2498,7 +3226,9 @@ const lot = async client =>
 
 // A device with a session but no redeemed code must see nothing.
 {
-  const anon = createClient(URL, KEY, { auth: { persistSession: false } })
+  const anon = createClient(URL, KEY, {
+    db: { schema: 'ehs' }, auth: { persistSession: false },
+  })
   await anon.auth.signInAnonymously()
   const { data } = await anon.from('machines').select('lot')
   check('no code: cannot read the catalog', (data ?? []).length === 0)
@@ -2582,9 +3312,9 @@ Expected: every line prints `PASS`, exit code 0. Any `FAIL` is a security hole �
 - [ ] **Step 4: Clean up the check's test rows**
 
 ```bash
-npx supabase db execute --command "
-delete from public.comments where author_name like 'rls-check-%';
-delete from public.profiles where display_name like 'rls-check-%';"
+psql "$(scripts/db-url.sh)" -v ON_ERROR_STOP=1 -c "
+delete from ehs.comments where author_name like 'rls-check-%';
+delete from ehs.profiles where display_name like 'rls-check-%';"
 ```
 
 - [ ] **Step 5: Commit**
@@ -2672,9 +3402,11 @@ jobs:
 
 `npm test` runs before the build on purpose: a failing calc regression should block the deploy, not ship.
 
-- [ ] **Step 3: Check the existing service worker**
+- [ ] **Step 3: Verify the service worker before deploy**
 
-Open `public/sw.js`. If it caches the app shell with a hardcoded version string, bump it — a stale cached shell will keep serving the pre-Supabase bundle after deploy. Confirm it does **not** cache `*.supabase.co` requests; caching an API response would show inspectors stale inspection data with no indication it is old.
+`public/sw.js` was fixed for the cache-first staleness defect: it is now network-first for navigations and same-origin scripts/styles (falling back to cache only when the network fails), uses a versioned cache name (`ehs-auction-inspector-v2`) that the `activate` handler purges old copies of, and is only registered in production (`src/main.tsx` guards registration with `import.meta.env.PROD`, and unregisters any worker a dev session may have installed).
+
+Before this deploy: if the app shell changed (anything in `SHELL` in `public/sw.js`, or the precache list), bump the `CACHE` version string so the new shell is installed cleanly. Confirm the fetch handler still returns early for any request that is not same-origin, so `*.supabase.co` requests are never intercepted, cached, or served from cache — caching an API response would show inspectors stale inspection data with no indication it is old.
 
 - [ ] **Step 4: Create the repo and push**
 
@@ -2703,7 +3435,7 @@ Expected: both jobs green. Open the published URL on a phone, enter the inspecto
 
 - [ ] **Step 8: Update the README**
 
-Replace the "For a static GitHub Pages build, entered inspection data stays on the browser/device" line and the "Static MVP persistence" claims with the shared model: access codes per role, live sync, offline-first, comments. Add a short **Operations** section covering: rotating a code with `set_access_code`, the Frankfurt region, and the free-tier 7-day pause risk before an auction.
+Replace the "For a static GitHub Pages build, entered inspection data stays on the browser/device" line and the "Static MVP persistence" claims with the shared model: access codes per role, live sync, offline-first, comments. Add a short **Operations** section covering: rotating a code with `set_access_code`, the eu-central-2 region and shared `ehs` schema, and the free-tier 7-day pause risk before an auction.
 
 - [ ] **Step 9: Commit**
 
@@ -2724,3 +3456,59 @@ git push
 - [ ] Viewer role: every write control visibly disabled, comment posting works
 - [ ] Legacy `localStorage` data imported and visible on a second device
 - [ ] Supabase project un-paused (or on a paid plan) before auction day
+
+## Post-review fixes (2026-09-08, pre-deployment)
+
+A final pre-deployment review found six correctness gaps, all fixed on
+`feat/shared-persistence` with the test suite kept green (68 → 75 tests).
+These amend the task descriptions above:
+
+- **Task 10 (`useMachineState`, boot pull)** — the boot effect's final
+  `setStates(seed({ ...(await getAllStates()) }))` replaced `states`
+  wholesale, ignoring `touchedRef` and reverting any edit typed while
+  `pullAll()` was still in flight (and poisoning `statesRef` for the next
+  keystroke). Fixed by merging: `setStates(prev => ...)` now builds from the
+  freshly-read cache but keeps `prev[lot]` for every lot in `touchedRef`.
+
+- **Task 10 (`useMachineState`, `patchState`)** — `patchState` computed
+  `next` from `statesRef.current` but committed via
+  `setStates(prev => ({ ...prev, [lot]: next }))`, so two patches dispatched
+  in the same React batch could lose the first one's value, in both the
+  in-memory cache and the outbox payload. Fixed with a `draftRef` that
+  synchronously tracks the latest value written per lot (React does not
+  guarantee a functional `setState` updater runs synchronously with the
+  call, so `prev` inside the updater can't safely be the source of truth
+  either); `patchState` now derives `next` from `draftRef` (falling back to
+  `statesRef`), so back-to-back calls compose correctly.
+
+- **Task 11 (`Photos.tsx`, upload)** — uploads used `{ upsert: true }`, which
+  is an UPDATE on `storage.objects`; the bucket's RLS policies (Task 9) grant
+  only SELECT/INSERT/DELETE, so a retry of a partially-succeeded upload (the
+  bytes landed, the response didn't) was denied forever. Fixed by dropping
+  `upsert` and treating a 409 / "already exists" upload error as success,
+  falling through to the same idempotent row-insert path already used for
+  `23505`. No storage policy changed.
+
+- **Task 11 (`Photos.tsx`, retry scope)** — the `online` retry listener only
+  drained pending photos for the lot currently on screen, so a photo shot on
+  a lot never revisited while online stayed device-local indefinitely, and
+  "Reset local cache" deleted it despite the Settings copy saying only
+  unsent edits were affected. Added `drainPendingPhotos(profileId)`,
+  exported from `Photos.tsx`, which walks every pending blob regardless of
+  lot; `App.tsx` calls it once on mount and again on every `online` event.
+  The reset copy in `App.tsx` now says photos are discarded too.
+
+- **Task 12 (`sync.ts`, reconnect backfill)** — `pullAll()` ran once at boot
+  and the realtime subscription was otherwise the only inbound path, so a
+  dropped websocket (phone lock, cell handover, laptop sleep) left the
+  viewer screen stale with no indication. Added a debounced backfill in
+  `startSync` triggered by `online` and by `document.visibilitychange`
+  turning visible, reusing `pullAll` + the same `isDirty` guard as the
+  realtime handler so an unsynced local edit is never overwritten.
+
+- **Comments (`Comments.tsx`)** — an insert failure was silently swallowed;
+  the design doc's "queue in the same outbox when offline" claim was never
+  implemented for comments. Rather than build full outbox queuing (a larger
+  change), `post()` now keeps the drafted text in the composer on failure
+  and shows a `role="alert"` message telling the author it wasn't sent. The
+  design doc is corrected to describe this instead of outbox queuing.

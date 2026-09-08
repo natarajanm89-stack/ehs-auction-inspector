@@ -48,7 +48,7 @@ Phone / laptop (GitHub Pages, static build)
     \- sync worker ....... push on reconnect, pull via realtime
                     |
                     v  HTTPS (anon key + anonymous-session JWT)
-              Supabase (region: eu-central-1 / Frankfurt)
+              Supabase (eu-central-2, schema: ehs)
                 |- Auth ......... anonymous sign-in, session persisted per device
                 |- Postgres ..... catalog, state, comments - all behind RLS
                 |- Realtime ..... state + comment changes pushed to clients
@@ -63,9 +63,17 @@ behaves exactly as it does today, showing "pending" instead of "synced".
 the JS bundle and is meant to be public. What a caller can read or write is
 decided server-side against their JWT and their `profiles` row.
 
-**Region:** Frankfurt. Inspectors do the time-sensitive writes on mobile data in
-the Netherlands; India readers absorb the extra latency without noticing. Region
-is fixed at project creation and cannot be changed afterwards.
+**Region:** eu-central-2 (Zurich), inherited from the existing project. Inspectors
+in the Netherlands take the fast path; India readers absorb a few hundred ms on a
+comment thread, which nobody notices. Region cannot be changed after project
+creation.
+
+**Schema:** everything lives in a dedicated `ehs` schema. The project
+(`zxfyfigmajlvgbddlbbx`, "VanithaHomeKitchen") already hosts an unrelated
+application in `public`, which this work must not touch. Two consequences: the
+JS client is constructed with `db: { schema: 'ehs' }`, and `ehs` must be added to
+the Data API's exposed schemas. The two apps share the project's quotas and its
+free-tier pause timer.
 
 ## Data model
 
@@ -153,8 +161,14 @@ Inbound realtime changes are applied to any lot **not currently dirty in the
 local outbox**, so an edit in progress is never yanked out from under the
 inspector.
 
-Comments write straight through when online (no merge problem, low value when
-stale) but queue in the same outbox when offline.
+Comments write straight through (no merge problem, low value when stale) and
+are **not** queued in the outbox. If the insert fails - offline or otherwise -
+the composer keeps the drafted text and shows an alert-role message telling
+the author it was not sent and their text is kept; nothing is retried
+automatically. Full outbox queuing for comments (durable across reloads,
+automatic retry) is more spec-faithful but a larger change than the
+pre-deployment fix window allowed; this is the minimum that is honest about
+what actually happened to the comment.
 
 ## Access and permissions
 
