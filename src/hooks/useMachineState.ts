@@ -5,6 +5,7 @@ import { machines } from '../data'
 import { enqueue, getAllStates, isDirty, putState } from '../lib/db'
 import { drainOutbox, pullAll, refreshPending, startSync } from '../lib/sync'
 import type { FieldGroup } from '../lib/db'
+import { getMode } from '../lib/mode'
 
 const GROUPS: FieldGroup[] = ['inspection', 'commercial', 'decision']
 
@@ -38,6 +39,7 @@ export function useAllMachineStates(canWrite: boolean) {
     ;(async () => {
       const local = await getAllStates()
       if (!cancelled) { setStates(seed(local)); setReady(true) }
+      if (getMode() === 'single') return   // no network at all in single mode
       try {
         const remote = await pullAll()
         if (cancelled) return
@@ -73,10 +75,14 @@ export function useAllMachineStates(canWrite: boolean) {
   }, [])
 
   // Realtime: sync.ts already guards against overwriting a dirty lot, so this
-  // callback just applies whatever it is handed.
-  useEffect(() => startSync((lot, remote) => {
-    setStates(prev => ({ ...prev, [lot]: { ...blankState(), ...remote } }))
-  }), [])
+  // callback just applies whatever it is handed. Skipped entirely in single
+  // mode - there is no server to sync with.
+  useEffect(() => {
+    if (getMode() === 'single') return
+    return startSync((lot, remote) => {
+      setStates(prev => ({ ...prev, [lot]: { ...blankState(), ...remote } }))
+    })
+  }, [])
 
   const patchState = useCallback((lot: number, group: FieldGroup, fn: (s: MachineState) => MachineState) => {
     if (!canWrite) return
@@ -100,9 +106,12 @@ export function useAllMachineStates(canWrite: boolean) {
     // Fire-and-forget: the UI must never wait on storage or the network.
     // db.ts reports failures via onStorageError, so these catches only swallow.
     void putState(lot, next).catch(() => {})
+    // Still enqueued in single mode, even though nothing drains it here - if
+    // the device is later switched to collaborative mode, the queued work
+    // must still be there to push.
     void enqueue({ lot, group, payload, updatedAt })
       .then(() => refreshPending())
-      .then(() => { if (navigator.onLine) return drainOutbox() })
+      .then(() => { if (getMode() !== 'single' && navigator.onLine) return drainOutbox() })
       .catch(() => {})
   }, [canWrite])
 
