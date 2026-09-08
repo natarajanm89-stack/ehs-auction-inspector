@@ -13,6 +13,7 @@ import { MachineImage } from './components/MachineImage'
 import { SheetVerification } from './components/SheetVerification'
 import { Photos, drainPendingPhotos } from './components/Photos'
 import { Comments, useUnreadCounts } from './components/Comments'
+import { getMode, setMode, isCollaborativeAvailable, getLocalName, setLocalName } from './lib/mode'
 
 type Tab = 'dashboard' | 'machines' | 'inspect' | 'bidboard' | 'sheets' | 'settings'
 
@@ -249,7 +250,11 @@ function App({ profile }: { profile: Profile }) {
 
       {tab === 'settings' && <section className="page narrow">
         <span className="eyebrow">OPERATING NOTES</span><h1>Settings & governance</h1>
-        <div className="panel"><h3>Shared live persistence</h3><p>Scores, notes, bids and decisions are saved to this device instantly and synced to the shared server in the background, so the whole team — on site or remote — sees the same data within seconds of a change. If you go offline, edits still save locally and upload automatically once you reconnect.</p></div>
+        <ModePanel />
+        {getMode() === 'single'
+          ? <div className="panel"><h3>Single device mode</h3><p>Scores, notes, bids and decisions are saved only to this device's storage. Nobody else on the team can see them from here — the way data leaves this device is <strong>Export</strong> (JSON) at the top of the screen, shared however you choose.</p></div>
+          : <div className="panel"><h3>Shared live persistence</h3><p>Scores, notes, bids and decisions are saved to this device instantly and synced to the shared server in the background, so the whole team — on site or remote — sees the same data within seconds of a change. If you go offline, edits still save locally and upload automatically once you reconnect.</p></div>
+        }
         <div className="panel"><h3>Commercial assumptions</h3><p>EUR→INR FX, freight, duty/import percentage, inland cost, repair reserve, contingency and target margin are editable per machine. The app does not claim these are tax advice or final customs values.</p></div>
         <div className="panel"><h3>Data provenance</h3><p>Starter lot facts come from the Ritchie Bros. Zevenbergen catalog/PDP pages checked on 7 Sep 2026. Auction catalog details can change. EHS inspection results are separate fields and should be treated as the controlling condition assessment.</p></div>
         <SignOut />
@@ -293,6 +298,51 @@ function decisionLabel(d: Decision) { return ({UNASSESSED:'UNASSESSED',BUY:'BUY'
 function MachineModal({ machine, state, close, inspect }: { machine: Machine, state: MachineState, close:()=>void, inspect:()=>void }) {
   const c=calc(machine,state||blankState())
   return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" onClick={close}>×</button><MachineImage machine={machine} className="modal-image"/><div className="modal-content"><div className="badges"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><Badge>{machine.category}</Badge><Badge>{machine.power}</Badge></div><h2>Lot {machine.lot} · {machine.make} {machine.model}</h2><p>{machine.title}</p><div className="detail-grid"><span>Year<strong>{machine.year}</strong></span><span>Hours<strong>{machine.hours?.toLocaleString()}</strong></span><span>Serial<strong>{machine.serial || 'Verify on site'}</strong></span><span>EHS fit<strong>{c.commercialFit}%</strong></span></div><h3>Catalog features</h3><ul>{machine.features.map(x=><li key={x}>{x}</li>)}</ul>{machine.notes && <div className="catalog-note"><strong>Catalog note</strong><p>{machine.notes}</p></div>}<p className="muted">Catalog fields are source-verified starter data, not an EHS condition guarantee. Verify serial, hours, CE, functions and defects during inspection.</p><div className="hero-actions"><button className="primary" onClick={inspect}>Start inspection</button><a className="button-link" href={machine.sourceUrl} target="_blank">Open source ↗</a></div></div></div></div>
+}
+
+function ModePanel() {
+  const [mode] = useState(getMode())
+  const [name, setName] = useState(getLocalName())
+  const [sync, setSync] = useState({ pending: 0 })
+  useEffect(() => subscribeStatus(s => setSync({ pending: s.pending })), [])
+
+  const available = isCollaborativeAvailable()
+
+  if (mode === 'single') {
+    return (
+      <div className="panel">
+        <h3>Mode: Single device</h3>
+        <p className="muted">Everything you record stays on this device. Nothing is sent anywhere unless you export it.</p>
+        <label>Your name (shown next to your work on this device)
+          <input value={name} maxLength={60} onChange={e => { setName(e.target.value); setLocalName(e.target.value) }} />
+        </label>
+        {!available && <p className="muted">This build has no server configured, so collaborative mode is unavailable.</p>}
+        <button className="ghost" disabled={!available} onClick={() => {
+          setMode('collaborative')
+          location.reload()
+        }}>Enable collaborative mode</button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="panel">
+      <h3>Mode: Collaborative</h3>
+      <p className="muted">Scores, notes, bids and decisions sync to the shared server so the whole team sees the same data.</p>
+      {sync.pending > 0 && (
+        <p className="muted" role="status">
+          {sync.pending} change{sync.pending > 1 ? 's have' : ' has'} not synced yet.
+          Switching now would strand that work locally until you switch back.
+        </p>
+      )}
+      <button className="ghost" onClick={() => {
+        if (sync.pending > 0 && !confirm('Some changes have not synced yet. Switch to single device mode anyway? Nothing is deleted, but the queued work will stop syncing until you switch back.')) return
+        setMode('single')
+        location.reload()
+      }}>Switch to single device mode</button>
+      <p className="muted">Switching does not sign you out or delete anything - it just stops syncing.</p>
+    </div>
+  )
 }
 
 export default App
