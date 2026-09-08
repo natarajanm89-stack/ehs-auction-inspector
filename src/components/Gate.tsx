@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ensureSession } from '../lib/supabase'
 import { cachedProfile, cacheProfile, fetchProfile, redeemCode, type Profile } from '../lib/profile'
+import { getMode, getLocalName } from '../lib/mode'
 
 // profile.ts throws human-readable messages for the cases it recognises, but a
 // genuinely unexpected failure (an RPC/Postgres error it didn't map) still
@@ -19,7 +20,20 @@ function readableRedeemError(err: unknown): string {
   return 'Something went wrong verifying that code. Please try again.'
 }
 
+const SINGLE_MODE_PROFILE: Profile = { id: 'local', display_name: getLocalName(), role: 'admin' }
+
 export function Gate({ children }: { children: (profile: Profile) => React.ReactNode }) {
+  if (getMode() === 'single') {
+    // No account, no network: single-device mode skips ensureSession/fetchProfile
+    // entirely. 'admin' here means only "no UI control is disabled" - there is
+    // no server to enforce anything against.
+    return <>{children({ ...SINGLE_MODE_PROFILE, display_name: getLocalName() })}</>
+  }
+
+  return <CollaborativeGate>{children}</CollaborativeGate>
+}
+
+function CollaborativeGate({ children }: { children: (profile: Profile) => React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null)
   const [booting, setBooting] = useState(true)
   const [offline, setOffline] = useState(false)
