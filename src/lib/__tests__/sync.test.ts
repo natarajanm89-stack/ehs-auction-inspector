@@ -5,18 +5,23 @@ const { rpc, fromMock, channelHandlers } = vi.hoisted(() => ({
   fromMock: vi.fn(),
   channelHandlers: [] as ((payload: any) => any)[],
 }))
+const { mockSupabase } = vi.hoisted(() => ({
+  mockSupabase: {} as any,
+}))
+Object.assign(mockSupabase, {
+  rpc,
+  from: fromMock,
+  channel: () => ({
+    on: (_event: string, _filter: any, handler: (payload: any) => any) => {
+      channelHandlers.push(handler)
+      return { subscribe: () => ({}) }
+    },
+  }),
+  removeChannel: vi.fn(),
+})
 vi.mock('../supabase', () => ({
-  supabase: {
-    rpc,
-    from: fromMock,
-    channel: () => ({
-      on: (_event: string, _filter: any, handler: (payload: any) => any) => {
-        channelHandlers.push(handler)
-        return { subscribe: () => ({}) }
-      },
-    }),
-    removeChannel: vi.fn(),
-  },
+  supabase: mockSupabase,
+  requireSupabase: () => mockSupabase,
   ensureSession: vi.fn(async () => 'uid-1'),
 }))
 

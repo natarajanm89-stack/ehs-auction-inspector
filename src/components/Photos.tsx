@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { supabase } from '../lib/supabase'
+import { requireSupabase } from '../lib/supabase'
 import { deletePhotoBlob, getPhotoBlob, listPendingPhotos, putPhotoBlob } from '../lib/db'
+import { getMode } from '../lib/mode'
 
 interface Shot { id: string; url: string; pending: boolean }
 
@@ -45,6 +46,7 @@ const SIGNED_URL_REFRESH_MS = 45 * 60 * 1000
  * achieve.
  */
 export async function uploadPhoto(lot: number, id: string, blob: Blob, profileId: string): Promise<boolean> {
+  const supabase = requireSupabase()
   const { error: uploadError } = await supabase.storage
     .from('inspection-photos').upload(id, blob, { contentType: 'image/jpeg' })
   if (uploadError) {
@@ -72,6 +74,7 @@ export async function uploadPhoto(lot: number, id: string, blob: Blob, profileId
  * local cache" would delete it silently.
  */
 export async function drainPendingPhotos(profileId: string): Promise<void> {
+  if (getMode() === 'single') return   // pending photos simply stay local
   for (const id of await listPendingPhotos()) {
     const lotStr = id.split('/')[0]
     const lot = Number(lotStr)
@@ -90,23 +93,30 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
   // replaced - otherwise a long inspection session leaks memory on a phone.
   const objectUrls = useRef<string[]>([])
 
-  const load = useCallback(async () => {
-    const { data } = await supabase.from('photos')
-      .select('id, storage_path').eq('lot', lot).order('created_at', { ascending: false })
+  const single = getMode() === 'single'
 
-    const rows = data ?? []
+  const load = useCallback(async () => {
     const uploaded: Shot[] = []
-    if (rows.length > 0) {
-      const paths = rows.map(row => row.storage_path)
-      const { data: signedList } = await supabase.storage
-        .from('inspection-photos').createSignedUrls(paths, SIGNED_URL_TTL)
-      const urlByPath = new Map<string, string>()
-      for (const signed of signedList ?? []) {
-        if (signed.signedUrl && signed.path) urlByPath.set(signed.path, signed.signedUrl)
-      }
-      for (const row of rows) {
-        const url = urlByPath.get(row.storage_path)
-        if (url) uploaded.push({ id: row.id, url, pending: false })
+    // Single mode never queries ehs.photos or signs URLs - photos captured
+    // here live only in IndexedDB.
+    if (!single) {
+      const supabase = requireSupabase()
+      const { data } = await supabase.from('photos')
+        .select('id, storage_path').eq('lot', lot).order('created_at', { ascending: false })
+
+      const rows = data ?? []
+      if (rows.length > 0) {
+        const paths = rows.map(row => row.storage_path)
+        const { data: signedList } = await supabase.storage
+          .from('inspection-photos').createSignedUrls(paths, SIGNED_URL_TTL)
+        const urlByPath = new Map<string, string>()
+        for (const signed of signedList ?? []) {
+          if (signed.signedUrl && signed.path) urlByPath.set(signed.path, signed.signedUrl)
+        }
+        for (const row of rows) {
+          const url = urlByPath.get(row.storage_path)
+          if (url) uploaded.push({ id: row.id, url, pending: false })
+        }
       }
     }
 
@@ -165,7 +175,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
         const id = `${lot}/${crypto.randomUUID()}.jpg`
         await putPhotoBlob(id, blob)        // survives a crash or signal loss
         await load()                        // show it immediately
-        if (navigator.onLine) {
+        if (!single && navigator.onLine) {
           const ok = await upload(id, blob)
           if (ok) setError('')
         }
@@ -180,6 +190,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
   // once per lot (not on every render) so the listener isn't added/removed
   // on every render.
   useEffect(() => {
+    if (single) return
     const retry = async () => {
       let allOk = true
       for (const id of await listPendingPhotos()) {
@@ -200,7 +211,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
   // An offline inspector is expected to have pending photos - only surface a
   // failure note once the device is online and photos are still stuck.
   const pendingCount = shots.filter(s => s.pending).length
-  const pendingNote = pendingCount > 0 && navigator.onLine
+  const pendingNote = !single && pendingCount > 0 && navigator.onLine
     ? `${pendingCount} photo${pendingCount > 1 ? 's' : ''} could not upload. ${pendingCount > 1 ? 'They are' : 'It is'} saved on this device and will retry.`
     : ''
 
@@ -210,7 +221,7 @@ export function Photos({ lot, canWrite, profileId }: { lot: number; canWrite: bo
         <label className="full">Photo evidence
           <input type="file" accept="image/*" capture="environment" multiple
                  disabled={busy} onChange={e => onPick(e.target.files)} />
-          <small>Stored on this device immediately, uploaded when there is signal.</small>
+          <small>{single ? 'Stored on this device.' : 'Stored on this device immediately, uploaded when there is signal.'}</small>
         </label>
       )}
       {(error || pendingNote) && <p className="photo-error" role="alert">{error || pendingNote}</p>}

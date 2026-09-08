@@ -1,4 +1,4 @@
-import { supabase } from './supabase'
+import { requireSupabase } from './supabase'
 import { dequeue, isDirty, listOutbox, putState, type FieldGroup } from './db'
 import { blankState } from './calc'
 import type { MachineState } from '../types'
@@ -42,6 +42,7 @@ export async function refreshPending(): Promise<void> {
 /** Pushes every queued field-group. Safe to call repeatedly. */
 export async function drainOutbox(): Promise<{ pushed: number; failed: number }> {
   if (draining) return { pushed: 0, failed: 0 }
+  const supabase = requireSupabase()
   draining = true
   let pushed = 0, failed = 0
 
@@ -122,6 +123,7 @@ async function reconcilePending(): Promise<void> {
 }
 
 export async function pullLot(lot: number): Promise<MachineState | null> {
+  const supabase = requireSupabase()
   const { data, error } = await supabase
     .from('machine_states')
     .select('*')
@@ -146,6 +148,7 @@ function rowToState(row: any): MachineState {
 }
 
 export async function pullAll(): Promise<Record<number, MachineState>> {
+  const supabase = requireSupabase()
   const { data, error } = await supabase.from('machine_states').select('*')
   if (error) throw error
   const out: Record<number, MachineState> = {}
@@ -164,6 +167,7 @@ export async function pullAll(): Promise<Record<number, MachineState>> {
  * the caller only guards its own copy.
  */
 export function startSync(onRemoteState: (lot: number, state: MachineState) => void): () => void {
+  const supabase = requireSupabase()
   currentOnRemoteState = onRemoteState
   const online  = () => { void refreshPending().then(() => drainOutbox()); scheduleBackfill() }
   const offline = () => emit({ status: 'offline' })

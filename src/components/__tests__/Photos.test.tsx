@@ -5,12 +5,15 @@ const { storageUploadMock, fromMock } = vi.hoisted(() => ({
   fromMock: vi.fn(),
 }))
 
+const { mockSupabase } = vi.hoisted(() => ({ mockSupabase: {} as any }))
 vi.mock('../../lib/supabase', () => ({
-  supabase: {
-    storage: { from: () => ({ upload: storageUploadMock, createSignedUrls: vi.fn() }) },
-    from: fromMock,
-  },
+  supabase: mockSupabase,
+  requireSupabase: () => mockSupabase,
 }))
+Object.assign(mockSupabase, {
+  storage: { from: () => ({ upload: storageUploadMock, createSignedUrls: vi.fn() }) },
+  from: fromMock,
+})
 
 import { clearAll, putPhotoBlob, listPendingPhotos } from '../../lib/db'
 import { drainPendingPhotos } from '../Photos'
@@ -19,6 +22,8 @@ beforeEach(async () => {
   await clearAll()
   storageUploadMock.mockReset()
   fromMock.mockReset()
+  // These tests exercise the collaborative upload path.
+  localStorage.setItem('ehs-mode', 'collaborative')
 })
 
 describe('drainPendingPhotos', () => {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
-import { supabase } from '../lib/supabase'
+import { requireSupabase } from '../lib/supabase'
 import type { Profile } from '../lib/profile'
+import { getMode } from '../lib/mode'
 
 interface Comment {
   id: string
@@ -23,23 +24,28 @@ function notifyRead(lot: number): void {
 }
 
 export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
+  const single = getMode() === 'single'
   const [items, setItems] = useState<Comment[]>([])
   const [draft, setDraft] = useState('')
   const [busy, setBusy] = useState(false)
   const [sendError, setSendError] = useState('')
 
   const load = useCallback(async () => {
+    if (single) return
+    const supabase = requireSupabase()
     const { data } = await supabase.from('comments')
       .select('*').eq('lot', lot).order('created_at', { ascending: true })
     setItems((data ?? []) as Comment[])
     await supabase.from('comment_reads')
       .upsert({ profile_id: profile.id, lot, last_read_at: new Date().toISOString() })
     notifyRead(lot)
-  }, [lot, profile.id])
+  }, [lot, profile.id, single])
 
   useEffect(() => { void load() }, [load])
 
   useEffect(() => {
+    if (single) return
+    const supabase = requireSupabase()
     const channel = supabase.channel(`comments_${lot}`)
       .on('postgres_changes',
           { event: 'INSERT', schema: 'ehs', table: 'comments', filter: `lot=eq.${lot}` },
@@ -57,13 +63,14 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
           })
       .subscribe()
     return () => { void supabase.removeChannel(channel) }
-  }, [lot, profile.id])
+  }, [lot, profile.id, single])
 
   const post = async (e: React.FormEvent) => {
     e.preventDefault()
     const body = draft.trim()
     if (!body) return
     setBusy(true)
+    const supabase = requireSupabase()
     const { error } = await supabase.from('comments').insert({
       lot, author_id: profile.id, author_name: profile.display_name, body,
     })
@@ -78,6 +85,15 @@ export function Comments({ lot, profile }: { lot: number; profile: Profile }) {
     // minimum honest behaviour is to keep the draft and say so plainly,
     // rather than silently discarding what the inspector typed.
     setSendError('Not sent - you appear to be offline. Your text is kept; try again when you have signal.')
+  }
+
+  if (single) {
+    return (
+      <div className="panel comments">
+        <h3>Team comments</h3>
+        <p className="muted">Comments are available in collaborative mode.</p>
+      </div>
+    )
   }
 
   return (
@@ -113,6 +129,8 @@ export function useUnreadCounts(profileId: string): Record<number, number> {
   const [counts, setCounts] = useState<Record<number, number>>({})
 
   useEffect(() => {
+    if (getMode() === 'single') return   // no comments, no unread counts
+    const supabase = requireSupabase()
     const compute = async () => {
       const [{ data: reads }, { data: comments }] = await Promise.all([
         supabase.from('comment_reads').select('lot, last_read_at').eq('profile_id', profileId),

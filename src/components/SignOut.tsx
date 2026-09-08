@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react'
-import { supabase } from '../lib/supabase'
+import { requireSupabase } from '../lib/supabase'
 import { cacheProfile } from '../lib/profile'
 import { subscribeStatus, type SyncSnapshot } from '../lib/sync'
+import { getMode } from '../lib/mode'
 
 /**
  * Signing out destroys the anonymous identity permanently - there is no signing
@@ -13,13 +14,15 @@ export function SignOut() {
   const [sync, setSync] = useState<SyncSnapshot>({ status: 'synced', pending: 0, lastSyncedAt: null })
   useEffect(() => subscribeStatus(setSync), [])
 
+  if (getMode() === 'single') return null   // no identity to end
+
   const blocked = sync.pending > 0 || sync.status !== 'synced'
 
   const signOut = async () => {
     if (blocked) return
     if (!confirm('Sign out of this device? You will need an access code to get back in.')) return
     cacheProfile(null)
-    await supabase.auth.signOut()
+    await requireSupabase().auth.signOut()
     location.reload()
   }
 

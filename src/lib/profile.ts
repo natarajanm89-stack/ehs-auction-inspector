@@ -1,4 +1,4 @@
-import { supabase, ensureSession, resetSession } from './supabase'
+import { requireSupabase, ensureSession, resetSession } from './supabase'
 
 export type Role = 'admin' | 'inspector' | 'viewer'
 
@@ -52,6 +52,7 @@ export function cacheProfile(p: Profile | null): void {
 }
 
 export async function fetchProfile(): Promise<Profile | null> {
+  const supabase = requireSupabase()
   const { data: session } = await supabase.auth.getSession()
   const uid = session.session?.user?.id
   if (!uid) {
@@ -87,6 +88,7 @@ function mapRedeemResult(data: unknown): Role {
 }
 
 export async function redeemCode(code: string, displayName: string): Promise<Role> {
+  const supabase = requireSupabase()
   const params = { p_code: code.trim(), p_display_name: displayName.trim() }
   const { data, error } = await supabase.rpc('redeem_access_code', params)
 

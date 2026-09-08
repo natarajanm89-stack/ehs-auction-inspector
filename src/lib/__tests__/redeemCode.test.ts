@@ -7,14 +7,14 @@ const { rpc, signOut, ensureSession, resetSession } = vi.hoisted(() => ({
   resetSession: vi.fn(),
 }))
 
+const { mockSupabase } = vi.hoisted(() => ({ mockSupabase: {} as any }))
 vi.mock('../supabase', () => ({
-  supabase: {
-    rpc,
-    auth: { signOut },
-  },
+  supabase: mockSupabase,
+  requireSupabase: () => mockSupabase,
   ensureSession,
   resetSession,
 }))
+Object.assign(mockSupabase, { rpc, auth: { signOut } })
 
 import { redeemCode } from '../profile'
 
