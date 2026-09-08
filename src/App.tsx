@@ -35,6 +35,7 @@ function App({ profile }: { profile: Profile }) {
   const [search, setSearch] = useState('')
   const [category, setCategory] = useState('All')
   const [priority, setPriority] = useState('All')
+  const [make, setMake] = useState('All')
   const [detailLot, setDetailLot] = useState<number | null>(null)
   const [storageError, setStorageError] = useState('')
   const [legacyCount, setLegacyCount] = useState(() => Object.keys(readLegacyState() ?? {}).length)
@@ -61,8 +62,9 @@ function App({ profile }: { profile: Profile }) {
     const matchQ = !q || `${m.lot} ${m.make} ${m.model} ${m.title}`.toLowerCase().includes(q)
     const matchC = category === 'All' || m.category === category
     const matchP = priority === 'All' || m.priority === priority
-    return matchQ && matchC && matchP
-  }), [search, category, priority])
+    const matchM = make === 'All' || m.make === make
+    return matchQ && matchC && matchP && matchM
+  }), [search, category, priority, make])
 
   const shortlist = machines.filter(m => states[m.lot]?.shortlist)
   const inspected = machines.filter(m => Object.values(states[m.lot]?.inspection.scores || {}).some(v => v > 0))
@@ -163,7 +165,19 @@ function App({ profile }: { profile: Profile }) {
         <div className="filterbar">
           <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="Search lot, make or model…" />
           <select value={category} onChange={e=>setCategory(e.target.value)}><option>All</option>{[...new Set(machines.map(m=>m.category))].map(x=><option key={x}>{x}</option>)}</select>
+          <select value={make} onChange={e=>setMake(e.target.value)} aria-label="Filter by make">
+            <option value="All">All makes</option>
+            {[...new Set(machines.map(m=>m.make))].sort().map(x=><option key={x}>{x}</option>)}
+          </select>
           <select value={priority} onChange={e=>setPriority(e.target.value)}><option>All</option><option>P1</option><option>P2</option><option>P3</option></select>
+        </div>
+        <div className="filter-count">
+          {filtered.length} of {machines.length} lots
+          {(search || category!=='All' || priority!=='All' || make!=='All') && (
+            <button className="ghost small" onClick={()=>{setSearch('');setCategory('All');setPriority('All');setMake('All')}}>
+              Clear filters
+            </button>
+          )}
         </div>
         <div className="machine-grid">{filtered.map(m => <MachineCard key={m.lot} machine={m} state={states[m.lot]} onOpen={()=>navigateMachine(m.lot)} onDetail={()=>setDetailLot(m.lot)} onShortlist={()=>patchState(m.lot,'decision',s=>({...s,shortlist:!s.shortlist}))} canWrite={canWrite} unread={unread[m.lot] ?? 0}/>)}</div>
       </section>}

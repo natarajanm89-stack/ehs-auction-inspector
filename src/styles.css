@@ -302,3 +302,6 @@ td select { min-width:110px; padding:7px; }
 .machine-image-fallback .mif-model { font-size: 13px; font-weight: 600; }
 .machine-image-fallback .mif-note { font-size: 11px; opacity: .7; }
 .modal-image.machine-image-fallback { min-height: 220px; }
+
+.filter-count { display: flex; align-items: center; gap: 10px; margin: 8px 0 14px;
+  font-size: 13px; font-weight: 600; color: #56607a; }
