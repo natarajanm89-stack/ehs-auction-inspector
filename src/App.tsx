@@ -9,6 +9,7 @@ import { subscribeStatus } from './lib/sync'
 import { useAllMachineStates } from './hooks/useMachineState'
 import { SyncBadge } from './components/SyncBadge'
 import { SignOut } from './components/SignOut'
+import { MachineImage } from './components/MachineImage'
 import { Photos, drainPendingPhotos } from './components/Photos'
 import { Comments, useUnreadCounts } from './components/Comments'
 
@@ -179,7 +180,7 @@ function App({ profile }: { profile: Profile }) {
           <select value={selectedLot} onChange={e=>setSelectedLot(Number(e.target.value))}>{machines.map(m=><option value={m.lot} key={m.lot}>Lot {m.lot} · {m.make} {m.model}</option>)}</select>
         </div>
         <div className="machine-hero">
-          <img src={selected.imageUrl} alt={selected.title}/>
+          <MachineImage machine={selected}/>
           <div><div className="badges"><Badge tone={selected.priority==='P1'?'danger':'warn'}>{selected.priority}</Badge><Badge>{selected.category}</Badge><Badge>{selected.power}</Badge></div><h1>Lot {selected.lot} · {selected.make} {selected.model}</h1><p>{selected.year} · {selected.hours?.toLocaleString()} h · {selected.location}</p><div className="spec-pills">{selected.features.map(x=><span key={x}>{x}</span>)}</div><div className="hero-actions"><a className="button-link" href={selected.sourceUrl} target="_blank">Open Ritchie lot ↗</a><button className="ghost" onClick={()=>setDetailLot(selected.lot)}>Catalog details</button></div></div>
         </div>
 
@@ -248,7 +249,7 @@ function MachineCard({ machine, state, compact=false, onOpen, onDetail, onShortl
   const c = calc(machine, state || blankState())
   const d = autoDecision(machine, state || blankState())
   return <article className={`machine-card ${compact?'compact':''}`}>
-    <div className="image-wrap"><img src={machine.imageUrl} alt={machine.title}/><div className="image-tags"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><button disabled={!canWrite} className={`shortlist-btn ${state?.shortlist?'on':''}`} onClick={onShortlist} title="Shortlist">★</button></div></div>
+    <div className="image-wrap"><MachineImage machine={machine}/><div className="image-tags"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><button disabled={!canWrite} className={`shortlist-btn ${state?.shortlist?'on':''}`} onClick={onShortlist} title="Shortlist">★</button></div></div>
     <div className="machine-body"><div className="lot-line"><strong>LOT {machine.lot}</strong>{unread > 0 && <span className="unread-dot">{unread}</span>}<Badge>{machine.category.replace(' Lift','')}</Badge></div><h3>{machine.make} {machine.model}</h3><p>{machine.year} · {machine.hours?.toLocaleString()} h · {machine.power}</p>{!compact && <div className="mini-specs">{machine.features.slice(0,2).map(x=><span key={x}>{x}</span>)}</div>}<div className="card-bottom"><div><small>Inspection</small><strong>{c.technical ? `${c.technical}%` : 'Not started'}</strong></div><Badge tone={d==='BUY'?'good':d==='BUY_IF'?'warn':d==='REJECT'?'danger':'neutral'}>{decisionLabel(d)}</Badge></div><div className="card-actions"><button className="primary" onClick={onOpen}>Inspect</button><button className="ghost" onClick={onDetail}>Details</button></div></div>
   </article>
 }
@@ -274,7 +275,7 @@ function decisionLabel(d: Decision) { return ({UNASSESSED:'UNASSESSED',BUY:'BUY'
 
 function MachineModal({ machine, state, close, inspect }: { machine: Machine, state: MachineState, close:()=>void, inspect:()=>void }) {
   const c=calc(machine,state||blankState())
-  return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" onClick={close}>×</button><img className="modal-image" src={machine.imageUrl} alt={machine.title}/><div className="modal-content"><div className="badges"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><Badge>{machine.category}</Badge><Badge>{machine.power}</Badge></div><h2>Lot {machine.lot} · {machine.make} {machine.model}</h2><p>{machine.title}</p><div className="detail-grid"><span>Year<strong>{machine.year}</strong></span><span>Hours<strong>{machine.hours?.toLocaleString()}</strong></span><span>Serial<strong>{machine.serial || 'Verify on site'}</strong></span><span>EHS fit<strong>{c.commercialFit}%</strong></span></div><h3>Catalog features</h3><ul>{machine.features.map(x=><li key={x}>{x}</li>)}</ul>{machine.notes && <div className="catalog-note"><strong>Catalog note</strong><p>{machine.notes}</p></div>}<p className="muted">Catalog fields are source-verified starter data, not an EHS condition guarantee. Verify serial, hours, CE, functions and defects during inspection.</p><div className="hero-actions"><button className="primary" onClick={inspect}>Start inspection</button><a className="button-link" href={machine.sourceUrl} target="_blank">Open source ↗</a></div></div></div></div>
+  return <div className="modal-backdrop" onMouseDown={close}><div className="modal" onMouseDown={e=>e.stopPropagation()}><button className="modal-close" onClick={close}>×</button><MachineImage machine={machine} className="modal-image"/><div className="modal-content"><div className="badges"><Badge tone={machine.priority==='P1'?'danger':'warn'}>{machine.priority}</Badge><Badge>{machine.category}</Badge><Badge>{machine.power}</Badge></div><h2>Lot {machine.lot} · {machine.make} {machine.model}</h2><p>{machine.title}</p><div className="detail-grid"><span>Year<strong>{machine.year}</strong></span><span>Hours<strong>{machine.hours?.toLocaleString()}</strong></span><span>Serial<strong>{machine.serial || 'Verify on site'}</strong></span><span>EHS fit<strong>{c.commercialFit}%</strong></span></div><h3>Catalog features</h3><ul>{machine.features.map(x=><li key={x}>{x}</li>)}</ul>{machine.notes && <div className="catalog-note"><strong>Catalog note</strong><p>{machine.notes}</p></div>}<p className="muted">Catalog fields are source-verified starter data, not an EHS condition guarantee. Verify serial, hours, CE, functions and defects during inspection.</p><div className="hero-actions"><button className="primary" onClick={inspect}>Start inspection</button><a className="button-link" href={machine.sourceUrl} target="_blank">Open source ↗</a></div></div></div></div>
 }
 
 export default App

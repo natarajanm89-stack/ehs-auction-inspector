@@ -289,3 +289,16 @@ td select { min-width:110px; padding:7px; }
 .comment-form { display: grid; gap: 8px; margin-top: 12px; }
 .unread-dot { background: #b42318; color: #fff; border-radius: 999px; font-size: 11px;
   font-weight: 700; padding: 1px 7px; }
+
+/* Fallback tile for lots with no catalogue photo. Sized by its container, like
+   the <img> it replaces, so card and modal layouts are unchanged. */
+.machine-image-fallback {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 4px; width: 100%; height: 100%; min-height: 140px; padding: 12px;
+  background: linear-gradient(135deg, #eef1f6 0%, #dfe4ec 100%);
+  color: #56607a; text-align: center;
+}
+.machine-image-fallback .mif-lot { font-size: 20px; font-weight: 800; letter-spacing: .04em; color: #2f3a52; }
+.machine-image-fallback .mif-model { font-size: 13px; font-weight: 600; }
+.machine-image-fallback .mif-note { font-size: 11px; opacity: .7; }
+.modal-image.machine-image-fallback { min-height: 220px; }
